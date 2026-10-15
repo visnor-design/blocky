@@ -1,7 +1,7 @@
 import * as db from './db.js';
 import * as api from './api.js';
 import { loadBitmap, autoDetect, renderCrop, mountCropper } from './image.js';
-import { buildBatch, shareBatch } from './share.js';
+import { buildBatch, shareBatch, warrantyDate, isoDate, buildIcs } from './share.js';
 
 /* ---------- pomocné funkcie ---------- */
 function h(tag, props, ...kids) {
@@ -41,13 +41,14 @@ const parseNum = (s) => { const n = parseFloat(String(s).replace(/\s/g, '').repl
 const numToStr = (n) => (n == null ? '' : String(n).replace('.', ','));
 const today = () => new Date().toLocaleDateString('sv-SE');
 const kb = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' kB');
+const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+const plural = (n) => (n === 1 ? 'bloček' : n >= 2 && n <= 4 ? 'bločky' : 'bločkov');
 const sumBy = (rs) => {
   const t = {};
   for (const r of rs) if (r.total) t[r.currency] = (t[r.currency] || 0) + r.total;
   return Object.entries(t).map(([c, v]) => money(v, c)).join(' + ');
 };
 
-const plural = (n) => (n === 1 ? 'bloček' : n >= 2 && n <= 4 ? 'bločky' : 'bločkov');
 const SOURCE = { 'sk-qr': 'eKasa QR', photo: 'Fotka', manual: 'Ručne' };
 const STATUS = { draft: 'Rozpracovaný', ready: 'Pripravený', sent: 'Odoslaný' };
 
@@ -59,10 +60,37 @@ function newReceipt(source, extra = {}) {
   return {
     id: crypto.randomUUID(), createdAt: Date.now(), updatedAt: Date.now(),
     source, status: 'draft',
-    vendor: '', ico: '', dic: '', icDph: '', date: today(), total: null, vat: null, currency: 'EUR', note: '',
-    receiptId: null, items: [], vatBreakdown: [], ekasaRaw: null, photo: null,
+    vendor: '', address: '', unitAddress: '', ico: '', dic: '', icDph: '',
+    date: today(), time: '', total: null, vat: null, currency: 'EUR', note: '',
+    receiptId: null, cashRegisterCode: '', receiptNumber: null, okp: '',
+    items: [], vatBreakdown: [], vatCheck: true, ekasaRaw: null, photo: null,
+    warrantyYears: null,
     batchId: null, sentAt: null, sentBy: null, ...extra,
   };
+}
+
+/* Logo-náhrada: farebná iniciálka (bez sťahovania, nič nezaťažuje). */
+function avatar(name, big = false) {
+  const words = String(name || '').replace(/[^\p{L}\p{N} ]/gu, ' ').trim().split(/\s+/).filter(Boolean);
+  const ini = (words[0]?.[0] || '?') + (words[1]?.[0] || '');
+  let hsh = 0;
+  for (const ch of String(name || '').toLowerCase()) hsh = (hsh * 31 + ch.charCodeAt(0)) % 8;
+  return h('span', { class: `avatar av${hsh}${big ? ' big' : ''}`, 'aria-hidden': 'true' }, ini.toUpperCase());
+}
+
+/* Záruka */
+function remaining(dt) {
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  const days = Math.round((dt - now) / 864e5);
+  if (days < 0) return { txt: 'vypršala', cls: 'gone', days };
+  if (days === 0) return { txt: 'dnes končí', cls: 'soon', days };
+  const cls = days <= 30 ? 'soon' : 'good';
+  if (days >= 365) {
+    const y = Math.floor(days / 365.25), mo = Math.floor((days - y * 365.25) / 30.44);
+    return { txt: `zostáva ${y} r.${mo ? ' ' + mo + ' mes.' : ''}`, cls, days };
+  }
+  if (days > 60) return { txt: `zostáva ${Math.round(days / 30.44)} mes.`, cls, days };
+  return { txt: `zostáva ${days} dní`, cls, days };
 }
 
 /* dialógy */
@@ -89,7 +117,9 @@ function confirmDialog({ title, text, yes, no }) {
 let cleanup = null;
 let pending = null;            // fotka čakajúca na orezanie { bmp, target }
 let listTab = 'todo';
-const selected = new Set();    // vybrané bločky na odoslanie
+let filtersOpen = false;
+const F = { q: '', from: '', to: '', min: '', max: '' };
+const selected = new Set();
 
 function go(view, params = {}, { replace = false } = {}) {
   const st = { view, params };
@@ -124,94 +154,144 @@ function installBanner(rerender) {
 }
 
 /* ---------- zoznam ---------- */
+const filtersActive = () => Object.values(F).some(Boolean);
+function passes(r) {
+  if (F.q) {
+    const hay = norm(`${r.vendor} ${r.ico} ${r.note} ${r.address}`);
+    if (!hay.includes(norm(F.q))) return false;
+  }
+  if (F.from && r.date < F.from) return false;
+  if (F.to && r.date > F.to) return false;
+  const mn = parseNum(F.min), mx = parseNum(F.max);
+  if (mn != null && !(r.total >= mn)) return false;
+  if (mx != null && !(r.total <= mx)) return false;
+  return true;
+}
+
 async function viewList() {
   const items = await db.all();
   const todo = items.filter((r) => r.status !== 'sent');
   const sent = items.filter((r) => r.status === 'sent');
+  const withW = items.filter((r) => r.warrantyYears && warrantyDate(r));
+  const activeW = withW.filter((r) => remaining(warrantyDate(r)).days >= 0);
   const ready = todo.filter((r) => r.status === 'ready');
   const drafts = todo.filter((r) => r.status === 'draft');
   for (const id of [...selected]) if (!ready.some((r) => r.id === id)) selected.delete(id);
-  const rerender = () => render({ view: 'list' });
+  const full = () => render({ view: 'list' });
 
   const tab = (key, label, count) => h('button', {
     class: 'tab' + (listTab === key ? ' on' : ''), role: 'tab', 'aria-selected': String(listTab === key),
-    onclick: () => { listTab = key; rerender(); },
+    onclick: () => { listTab = key; full(); },
   }, label, h('span', { class: 'count num' }, String(count)));
 
+  const big = listTab === 'todo'
+    ? [String(ready.length), ready.length === 1 ? 'pripravený na odoslanie' : 'pripravených na odoslanie', `${drafts.length} rozpracovaných${ready.length ? ' · ' + sumBy(ready) : ''}`]
+    : listTab === 'sent'
+      ? [String(sent.length), sent.length === 1 ? 'odoslaný bloček' : 'odoslaných bločkov', sumBy(sent)]
+      : [String(activeW.length), 'platných záruk', `${withW.length - activeW.length} vypršaných`];
+
   const hero = h('header', { class: 'hero' }, h('div', { class: 'wrap' },
-    h('div', { class: 'hero-top' },
-      h('h1', null, 'Bločky'),
-      h('button', { class: 'ghost', onclick: openSettings }, 'Nastavenia')),
-    listTab === 'todo'
-      ? h('div', { class: 'big' },
-          h('span', { class: 'big-n num' }, String(ready.length)),
-          h('span', { class: 'big-l' }, ready.length === 1 ? 'pripravený na odoslanie' : 'pripravených na odoslanie'),
-          h('span', { class: 'big-s num' }, `${drafts.length} rozpracovaných${ready.length ? ' · ' + sumBy(ready) : ''}`))
-      : h('div', { class: 'big' },
-          h('span', { class: 'big-n num' }, String(sent.length)),
-          h('span', { class: 'big-l' }, sent.length === 1 ? 'odoslaný bloček' : 'odoslaných bločkov')),
-    h('div', { class: 'tabs', role: 'tablist' }, tab('todo', 'K odoslaniu', todo.length), tab('sent', 'Odoslané', sent.length))));
+    h('div', { class: 'hero-top' }, h('h1', null, 'Bločky'), h('button', { class: 'ghost', onclick: openSettings }, 'Nastavenia')),
+    h('div', { class: 'big' }, h('span', { class: 'big-n num' }, big[0]), h('span', { class: 'big-l' }, big[1]), h('span', { class: 'big-s num' }, big[2])),
+    h('div', { class: 'tabs', role: 'tablist' }, tab('todo', 'Aktuálne', todo.length), tab('sent', 'Odoslané', sent.length), tab('warranty', 'Záruky', withW.length))));
 
-  const content = h('main', { class: 'wrap content' }, installBanner(rerender));
+  /* filter */
+  const listBox = h('div');
+  const dockBox = h('div');
+  const infoBox = h('p', { class: 'filterinfo num' });
+  const filterBtn = h('button', { class: 'btn small', onclick: () => { filtersOpen = !filtersOpen; full(); } }, filtersOpen ? 'Skryť filter' : 'Filter' + (filtersActive() ? ' •' : ''));
+  const search = h('input', { class: 'search', type: 'search', placeholder: 'Hľadať bloček', 'aria-label': 'Hľadať' });
+  search.value = F.q;
+  search.addEventListener('input', () => { F.q = search.value; drawList(); });
+  const fin = (label, key, attrs) => {
+    const i = h('input', { id: 'flt-' + key, ...attrs }); i.value = F[key];
+    i.addEventListener('input', () => { F[key] = i.value; drawList(); });
+    return h('div', { class: 'field' }, h('label', { for: 'flt-' + key }, label), i);
+  };
+  const panel = filtersOpen ? h('div', { class: 'filterpanel' },
+    h('div', { class: 'grid2' }, fin('Dátum od', 'from', { type: 'date' }), fin('Dátum do', 'to', { type: 'date' })),
+    h('div', { class: 'grid2' }, fin('Suma od', 'min', { inputmode: 'decimal' }), fin('Suma do', 'max', { inputmode: 'decimal' })),
+    h('button', { class: 'btn small', onclick: () => { Object.keys(F).forEach((k) => (F[k] = '')); full(); } }, 'Vymazať filter')) : null;
 
-  if (listTab === 'todo') {
-    if (todo.length === 0) {
-      content.append(h('div', { class: 'paper' }, h('div', { class: 'empty' },
-        h('strong', null, 'Zatiaľ tu nie sú žiadne bločky'),
-        h('p', null, 'Naskenuj QR kód zo slovenského bločku alebo odfoť zahraničný doklad.'))));
-    } else {
-      if (ready.length > 1) {
-        const all = selected.size === ready.length;
-        content.append(h('div', { class: 'selbar' },
-          h('span', { class: 'num' }, `Vybrané: ${selected.size} z ${ready.length}`),
-          h('button', { class: 'linkbtn', onclick: () => { all ? selected.clear() : ready.forEach((r) => selected.add(r.id)); rerender(); } }, all ? 'Zrušiť výber' : 'Vybrať všetky')));
-      }
-      content.append(h('div', { class: 'paper' }, todo.map((r) => rowEl(r, true, rerender))));
-    }
-  } else if (sent.length === 0) {
-    content.append(h('div', { class: 'paper' }, h('div', { class: 'empty' },
-      h('strong', null, 'Zatiaľ nič nebolo odoslané'),
-      h('p', null, 'Po odoslaní emailom sa tu zobrazí história po dávkach.'))));
-  } else {
-    const batches = new Map();
-    for (const r of sent) { const k = r.batchId || 'bez-davky'; (batches.get(k) || batches.set(k, []).get(k)).push(r); }
-    [...batches.values()].sort((a, b) => b[0].sentAt - a[0].sentAt).forEach((rs) => {
-      content.append(h('section', { class: 'batch' },
-        h('h2', null, fmtDateTime(rs[0].sentAt)),
-        h('p', { class: 'meta num' }, `${rs.length} ${plural(rs.length)} · ${sumBy(rs)}${rs[0].sentBy ? ' · ' + rs[0].sentBy : ''}`),
-        h('div', { class: 'paper' }, rs.map((r) => rowEl(r, false, rerender))),
-        h('div', { class: 'foot' },
-          h('button', { class: 'btn small', onclick: () => openSendSheet(rs.map((r) => r.id), true) }, 'Odoslať znova'),
-          h('button', { class: 'btn small', onclick: async () => {
-            for (const r of rs) { r.status = 'ready'; r.batchId = null; r.sentAt = null; r.sentBy = null; await db.put(r); selected.add(r.id); }
-            listTab = 'todo'; rerender();
-          } }, 'Vrátiť medzi pripravené'))));
-    });
+  function drawDock() {
+    dockBox.replaceChildren(h('div', { class: 'dock' }, h('div', { class: 'wrap dock-in' },
+      h('button', { class: 'btn' + (selected.size ? '' : ' primary grow'), onclick: () => go('scan') }, '+ Skenovať'),
+      selected.size > 0 && listTab === 'todo' && h('button', { class: 'btn primary grow', onclick: () => openSendSheet([...selected]) }, `Odoslať (${selected.size})`))));
   }
 
-  const dock = h('div', { class: 'dock' }, h('div', { class: 'wrap dock-in' },
-    h('button', { class: 'btn' + (selected.size ? '' : ' primary grow'), onclick: () => go('scan') }, '+ Skenovať'),
-    selected.size > 0 && h('button', { class: 'btn primary grow', onclick: () => openSendSheet([...selected]) }, `Odoslať (${selected.size})`)));
+  function drawList() {
+    listBox.replaceChildren();
+    const src = listTab === 'todo' ? todo : listTab === 'sent' ? sent : withW;
+    const shown = src.filter(passes);
+    infoBox.textContent = filtersActive() ? `Zobrazené ${shown.length} z ${src.length} · ${sumBy(shown) || '—'}` : '';
+    infoBox.hidden = !filtersActive();
 
-  $app.append(hero, content, dock);
+    if (shown.length === 0) {
+      const none = src.length === 0;
+      listBox.append(h('div', { class: 'paper' }, h('div', { class: 'empty' },
+        h('strong', null, none ? (listTab === 'todo' ? 'Zatiaľ tu nie sú žiadne bločky' : listTab === 'sent' ? 'Zatiaľ nič nebolo odoslané' : 'Zatiaľ nemáš žiadne záruky') : 'Filtru nezodpovedá žiadny bloček'),
+        h('p', null, none ? (listTab === 'todo' ? 'Naskenuj QR kód zo slovenského bločku alebo odfoť zahraničný doklad.' : listTab === 'sent' ? 'Po odoslaní emailom sa tu zobrazí história po dávkach.' : 'Záruku pridáš v detaile bločku.') : 'Zmeň alebo vymaž filter.'))));
+    } else if (listTab === 'todo') {
+      const rdy = shown.filter((r) => r.status === 'ready');
+      if (rdy.length > 1) {
+        const all = rdy.every((r) => selected.has(r.id));
+        listBox.append(h('div', { class: 'selbar' },
+          h('span', { class: 'num' }, `Vybrané: ${selected.size}`),
+          h('button', { class: 'linkbtn', onclick: () => { all ? rdy.forEach((r) => selected.delete(r.id)) : rdy.forEach((r) => selected.add(r.id)); drawList(); } }, all ? 'Zrušiť výber' : 'Vybrať všetky')));
+      }
+      listBox.append(h('div', { class: 'paper' }, shown.map((r) => rowEl(r, { selectable: true, redraw: drawList }))));
+    } else if (listTab === 'sent') {
+      const batches = new Map();
+      for (const r of shown) { const k = r.batchId || 'bez-davky'; (batches.get(k) || batches.set(k, []).get(k)).push(r); }
+      [...batches.values()].sort((a, b) => b[0].sentAt - a[0].sentAt).forEach((rs) => {
+        listBox.append(h('section', { class: 'batch' },
+          h('h2', null, fmtDateTime(rs[0].sentAt)),
+          h('p', { class: 'meta num' }, `${rs.length} ${plural(rs.length)} · ${sumBy(rs)}${rs[0].sentBy ? ' · ' + rs[0].sentBy : ''}`),
+          h('div', { class: 'paper' }, rs.map((r) => rowEl(r, {}))),
+          h('div', { class: 'foot' },
+            h('button', { class: 'btn small', onclick: () => openSendSheet(rs.map((r) => r.id), true) }, 'Odoslať znova'),
+            h('button', { class: 'btn small', onclick: async () => {
+              for (const r of rs) { r.status = 'ready'; r.batchId = null; r.sentAt = null; r.sentBy = null; await db.put(r); selected.add(r.id); }
+              listTab = 'todo'; full();
+            } }, 'Vrátiť medzi pripravené'))));
+      });
+    } else {
+      const sorted = [...shown].sort((a, b) => {
+        const ea = warrantyDate(a), eb = warrantyDate(b), ga = ea < new Date(), gb = eb < new Date();
+        return ga !== gb ? ga - gb : ga ? eb - ea : ea - eb;
+      });
+      listBox.append(h('div', { class: 'paper' }, sorted.map((r) => rowEl(r, { warranty: true }))));
+    }
+    drawDock();
+  }
+
+  $app.append(hero,
+    h('main', { class: 'wrap content' }, installBanner(full),
+      h('div', { class: 'filterbar' }, search, filterBtn), panel, infoBox, listBox),
+    dockBox);
+  drawList();
 }
 
-function rowEl(r, selectable, rerender) {
-  const check = selectable && r.status === 'ready'
-    ? h('label', { class: 'pick', 'aria-label': 'Vybrať na odoslanie' },
-        (() => {
-          const i = h('input', { type: 'checkbox' });
-          i.checked = selected.has(r.id);
-          i.addEventListener('change', () => { i.checked ? selected.add(r.id) : selected.delete(r.id); rerender(); });
-          return i;
-        })())
-    : h('span', { class: 'pick none' });
-  return h('div', { class: 'row' }, check,
+function rowEl(r, { selectable = false, redraw = null, warranty = false } = {}) {
+  let pick = null;
+  if (selectable && r.status === 'ready') {
+    const i = h('input', { type: 'checkbox' });
+    i.checked = selected.has(r.id);
+    i.addEventListener('change', () => { i.checked ? selected.add(r.id) : selected.delete(r.id); redraw(); });
+    pick = h('label', { class: 'pick', 'aria-label': 'Vybrať na odoslanie' }, i);
+  }
+  let meta = fmtDate(r.date);
+  let chip = h('span', { class: `chip ${r.status}` }, STATUS[r.status]);
+  if (warranty) {
+    const w = warrantyDate(r), rem = remaining(w);
+    meta = `Záruka do ${fmtDate(isoDate(w))}`;
+    chip = h('span', { class: `chip ${rem.cls}` }, rem.txt);
+  }
+  return h('div', { class: 'row' }, pick, avatar(r.vendor),
     h('button', { class: 'main', onclick: () => go('form', { id: r.id }) },
       h('span', { class: 'vendor' }, r.vendor || 'Bez názvu'),
       h('span', { class: 'amount num' }, money(r.total, r.currency)),
-      h('span', { class: 'meta' }, `${fmtDate(r.date)} · ${SOURCE[r.source] || ''}`),
-      h('span', { class: `chip ${r.status}` }, STATUS[r.status])));
+      h('span', { class: 'meta' }, meta), chip));
 }
 
 /* ---------- nastavenia ---------- */
@@ -219,15 +299,31 @@ function openSettings() {
   const st = getSettings();
   const name = h('input', { id: 's-name', autocomplete: 'name', placeholder: 'Meno a priezvisko' }); name.value = st.name || '';
   const to = h('input', { id: 's-to', type: 'email', autocomplete: 'off', placeholder: 'blocky@firma.sk' }); to.value = st.to || '';
+  const url = h('input', { id: 's-url', type: 'url', autocomplete: 'off', placeholder: 'https://moj-proxy.workers.dev (nepovinné)' }); url.value = st.lookupUrl || '';
   const enh = h('input', { id: 's-enh', type: 'checkbox' }); enh.checked = st.enhance !== false;
+  const mode = (val, title, sub) => {
+    const i = h('input', { type: 'radio', name: 'sendmode', value: val }); i.checked = (st.sendMode || 'share') === val;
+    return h('label', { class: 'radio' }, i, h('span', null, title, h('small', null, sub)));
+  };
   const d = openDialog(h('div', { class: 'dlg-body' },
     h('h2', null, 'Nastavenia'),
     h('div', { class: 'form' },
       h('div', { class: 'field' }, h('label', { for: 's-name' }, 'Tvoje meno'), name),
       h('div', { class: 'field' }, h('label', { for: 's-to' }, 'Email účtovníčky'), to),
+      h('div', { class: 'field' }, h('label', null, 'Spôsob odoslania'),
+        mode('share', 'Zdieľať s prílohami', 'Otvorí zoznam aplikácií (Mail, Outlook, Gmail). Prílohy sú pripojené automaticky.'),
+        mode('mailto', 'Stiahnuť súbory a otvoriť predvolenú poštu', 'Otvorí sa predvolená pošta s adresátom, prílohy pridáš ručne zo stiahnutých súborov.')),
+      h('div', { class: 'field' }, h('label', { for: 's-url' }, 'Adresa servera pre eKasa'), url,
+        h('span', { class: 'note' }, 'Potrebné, ak telefón údaje zo slovenského bločku nevie načítať priamo.')),
       h('label', { class: 'check' }, enh, h('span', null, 'Zvýrazniť text na fotke (menší súbor, lepšie čitateľný)'))),
     h('div', { class: 'actions' },
-      h('button', { class: 'btn primary', onclick: () => { setSettings({ ...st, name: name.value.trim(), to: to.value.trim(), enhance: enh.checked }); d.close(); toast('Nastavenia uložené.'); } }, 'Uložiť'),
+      h('button', { class: 'btn primary', onclick: () => {
+        const u = url.value.trim();
+        if (u && !/^https:\/\//i.test(u)) return toast('Adresa servera musí začínať https://');
+        const sm = d.querySelector('input[name=sendmode]:checked')?.value || 'share';
+        setSettings({ ...st, name: name.value.trim(), to: to.value.trim(), lookupUrl: u, sendMode: sm, enhance: enh.checked });
+        d.close(); toast('Nastavenia uložené.');
+      } }, 'Uložiť'),
       h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť'))));
 }
 
@@ -238,19 +334,21 @@ async function openSendSheet(ids, resend = false) {
   if (!rs.length) return toast('Nie je čo odoslať.');
   const st = getSettings();
   const batch = buildBatch(rs, st);
-  const tooBig = batch.totalBytes > 20 * 1048576;
+  const mailto = st.sendMode === 'mailto';
 
   const d = openDialog(h('div', { class: 'dlg-body' },
     h('h2', null, `Odoslať ${rs.length} ${plural(rs.length)}`),
     h('p', { class: 'num' }, `${batch.sum} · ${batch.files.length} príloh · ${kb(batch.totalBytes)}`),
-    tooBig && h('p', { class: 'banner' }, 'Prílohy majú viac ako 20 MB. Niektoré pošty ich neodošlú. Rozdeľ odosielanie na menej bločkov.'),
+    batch.totalBytes > 20 * 1048576 && h('p', { class: 'banner' }, 'Prílohy majú viac ako 20 MB. Niektoré pošty ich neodošlú. Rozdeľ odosielanie na menej bločkov.'),
     h('div', { class: 'addr' },
       h('div', null, h('div', { class: 'meta' }, 'Adresát'), h('strong', null, st.to || 'nie je nastavený (Nastavenia)')),
       st.to && h('button', { class: 'btn small', onclick: async () => { try { await navigator.clipboard.writeText(st.to); toast('Adresa skopírovaná.'); } catch { toast('Adresu sa nepodarilo skopírovať.'); } } }, 'Kopírovať')),
-    h('p', { class: 'note' }, 'Pošta sa otvorí so všetkými prílohami. Adresu vyber alebo vlož skopírovanú a email odošli zo svojho účtu.'),
+    h('p', { class: 'note' }, mailto
+      ? 'Súbory sa stiahnu a otvorí sa predvolená pošta s adresátom. Pripoj stiahnuté súbory a email odošli.'
+      : 'Otvorí sa zoznam aplikácií so všetkými prílohami. Vyber poštu, vlož adresu a odošli zo svojho účtu.'),
     h('div', { class: 'actions' },
       h('button', { class: 'btn primary', onclick: async () => {
-        const res = await shareBatch({ ...batch, to: st.to });   // volá sa hneď po kliknutí
+        const res = await shareBatch({ ...batch, to: st.to, mode: st.sendMode });   // hneď po kliknutí
         d.close();
         if (res.status === 'cancelled') return;
         if (res.status === 'error') return toast('Odoslanie zlyhalo. Skús to znova.');
@@ -265,7 +363,7 @@ async function openSendSheet(ids, resend = false) {
         for (const r of rs) { r.status = 'sent'; r.batchId = batchId; r.sentAt = sentAt; r.sentBy = st.name || ''; selected.delete(r.id); await db.put(r); }
         toast('Označené ako odoslané.');
         render({ view: 'list' });
-      } }, 'Otvoriť poštu'),
+      } }, mailto ? 'Stiahnuť a otvoriť poštu' : 'Otvoriť poštu'),
       h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť'))));
 }
 
@@ -304,7 +402,7 @@ function viewScan() {
     hint.textContent = 'Načítavam údaje z eKasa…';
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 8000);
-    const res = await api.lookupEkasa(rid, { signal: ctl.signal });
+    const res = await api.lookupEkasa(rid, { signal: ctl.signal, url: getSettings().lookupUrl || undefined });
     clearTimeout(t);
     const r = newReceipt('sk-qr', { receiptId: rid });
     if (res.ok) Object.assign(r, res.data, { lookup: 'ok' }); else r.lookup = res.reason;
@@ -393,73 +491,189 @@ function viewCrop() {
       h('button', { class: 'btn', onclick: () => { pending = null; history.back(); } }, 'Zrušiť'))));
 }
 
-/* ---------- formulár bločku ---------- */
+/* ---------- detail bločku ---------- */
+const RETRY_TEXT = {
+  network: 'Telefón sa nevie spojiť s finančnou správou. Najčastejšie to blokuje prehliadač (CORS) alebo nie si online. Zadaj v Nastaveniach adresu servera.',
+  timeout: 'Finančná správa neodpovedala včas.',
+  not_found: 'Finančná správa tento doklad nenašla. Skontroluj, či je QR kód celý.',
+};
+
 async function viewForm(id) {
   const r = await db.get(id);
   if (!r) { toast('Bloček sa nenašiel.'); return go('list', {}, { replace: true }); }
   const locked = r.status === 'sent';
+  const official = r.source === 'sk-qr' && r.lookup === 'ok';
+  let editing = !official;       // údaje zo štátu sú predvolene len na čítanie
+  let showAllItems = false;
+  let customYears = false;
   let saveTimer;
   const persist = () => { clearTimeout(saveTimer); r.updatedAt = Date.now(); return db.put(r); };
   const autosave = () => { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 400); };
   let photoUrl = r.photo ? URL.createObjectURL(r.photo) : null;
   cleanup = () => { persist(); if (photoUrl) URL.revokeObjectURL(photoUrl); };
 
+  const head = h('div', { class: 'detail-head' });
+  const body = h('div');
   const errs = {};
   const errEl = (k) => (errs[k] = h('div', { class: 'err' }));
+
+  function drawHead() {
+    head.replaceChildren(avatar(r.vendor, true),
+      h('div', { class: 'who' }, h('h1', { class: 'ttl' }, r.vendor || 'Nový bloček'),
+        h('div', { class: 'meta' }, `${fmtDate(r.date)}${r.time ? ' ' + r.time.slice(0, 5) : ''} · ${SOURCE[r.source]}`)),
+      h('div', { class: 'tot' }, h('span', null, 'Celková suma'), h('strong', { class: 'num' }, money(r.total, r.currency))));
+  }
+
   const field = (label, key, attrs = {}, parse = (v) => v, show = (v) => v ?? '') => {
     const input = h('input', { id: 'f-' + key, ...attrs, disabled: locked, value: show(r[key]) });
-    input.addEventListener('input', () => { r[key] = parse(input.value); autosave(); });
+    input.addEventListener('input', () => { r[key] = parse(input.value); autosave(); drawHead(); });
     return h('div', { class: 'field' }, h('label', { for: 'f-' + key }, label), input, errEl(key));
   };
+  const kv = (rows) => h('dl', { class: 'kv' }, rows.filter(([, v]) => v !== '' && v != null).map(([k, v]) => h('div', null, h('dt', null, k), h('dd', null, v))));
 
-  const currency = h('select', { id: 'f-currency', disabled: locked },
-    ['EUR', 'CZK', 'PLN', 'HUF', 'USD', 'GBP', 'CHF'].map((c) => h('option', { value: c }, c)));
-  currency.value = r.currency;
-  currency.addEventListener('change', () => { r.currency = currency.value; autosave(); });
-  const note = h('textarea', { id: 'f-note', rows: '2', disabled: locked }); note.value = r.note;
-  note.addEventListener('input', () => { r.note = note.value; autosave(); });
-
+  /* fotka */
   const fileInput = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
-  const photoBox = h('div', { class: 'photo' });
   const dlg = h('dialog', { class: 'lightbox' });
-  const drawPhoto = () => {
-    photoBox.replaceChildren();
-    if (photoUrl) {
-      photoBox.append(h('button', { class: 'thumbbtn', 'aria-label': 'Zobraziť fotku', onclick: () => {
-        dlg.replaceChildren(h('img', { src: photoUrl, alt: 'Fotka bločku', onclick: () => dlg.close() })); dlg.showModal();
-      } }, h('img', { class: 'thumb', src: photoUrl, alt: '' })),
-      h('span', { class: 'meta num' }, kb(r.photo.size)));
-    }
-    if (!locked) photoBox.append(h('button', { class: 'btn small', onclick: () => fileInput.click() }, photoUrl ? 'Zmeniť fotku' : 'Pridať fotku'));
-  };
   fileInput.addEventListener('change', async () => {
     const f = fileInput.files[0]; if (!f) return;
     try { await persist(); pending = { bmp: await loadBitmap(f), target: r.id }; go('crop'); }
     catch { toast('Fotku sa nepodarilo načítať.'); }
   });
-  drawPhoto();
+  const photoBox = () => h('div', { class: 'photo' },
+    photoUrl && h('button', { class: 'thumbbtn', 'aria-label': 'Zobraziť fotku', onclick: () => {
+      dlg.replaceChildren(h('img', { src: photoUrl, alt: 'Fotka bločku', onclick: () => dlg.close() })); dlg.showModal();
+    } }, h('img', { class: 'thumb', src: photoUrl, alt: '' })),
+    photoUrl && h('span', { class: 'meta num' }, kb(r.photo.size)),
+    !locked && h('button', { class: 'btn small', onclick: () => fileInput.click() }, photoUrl ? 'Zmeniť fotku' : 'Pridať fotku'),
+    errEl('photo'));
 
-  const lookupBanner = r.source === 'sk-qr'
-    ? (r.lookup === 'ok'
-      ? h('div', { class: 'banner ok' }, 'Údaje boli načítané z finančnej správy. Skontroluj ich.')
-      : h('div', { class: 'banner' }, 'Údaje z eKasa sa zatiaľ nepodarilo načítať. ID bločku je uložené a doplnia sa po napojení na server. Zatiaľ ich môžeš vyplniť ručne.'))
-    : null;
+  /* eKasa: opakované načítanie */
+  async function retry(btn) {
+    btn.disabled = true; btn.textContent = 'Načítavam…';
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
+    const res = await api.lookupEkasa(r.receiptId, { signal: ctl.signal, url: getSettings().lookupUrl || undefined });
+    clearTimeout(t);
+    if (res.ok) { Object.assign(r, res.data, { lookup: 'ok' }); await persist(); toast('Údaje načítané.'); return render({ view: 'form', params: { id: r.id } }); }
+    r.lookup = res.reason; await persist(); btn.disabled = false; btn.textContent = 'Skúsiť znova';
+    toast('Údaje sa nepodarilo načítať.');
+    drawBody();
+  }
 
-  const taxOpen = r.source === 'sk-qr' || r.ico || r.dic || r.icDph;
-  const tax = h('details', { class: 'items', open: taxOpen ? true : null },
-    h('summary', null, 'Daňové údaje predajcu'),
-    h('div', { class: 'form inner' },
-      field('IČO', 'ico', { inputmode: 'numeric', autocomplete: 'off' }),
-      h('div', { class: 'grid2' },
-        field('DIČ', 'dic', { inputmode: 'numeric', autocomplete: 'off' }),
-        field('IČ DPH', 'icDph', { autocomplete: 'off' })),
-      r.vatBreakdown?.length > 0 && h('ul', { class: 'vatlist' }, r.vatBreakdown.map((b) =>
-        h('li', null, h('span', null, `DPH ${b.rate} %`), h('span', { class: 'num' }, `základ ${money(b.base, r.currency)} · DPH ${money(b.vat, r.currency)}`))))));
+  function warrantySec() {
+    const sec = h('section', { class: 'sec' }, h('h3', null, 'Záruka'));
+    if (!r.warrantyYears) {
+      sec.append(h('button', { class: 'btn small', disabled: locked, onclick: () => { r.warrantyYears = 2; persist(); drawBody(); } }, 'Pridať záruku'));
+      return sec;
+    }
+    const until = h('p', { class: 'meta' });
+    const paintUntil = () => {
+      const w = warrantyDate(r);
+      until.textContent = w ? `Platí do ${fmtDate(isoDate(w))} (${remaining(w).txt}). Počíta sa od dátumu bločku, ${fmtDate(r.date)}.` : '';
+    };
+    const preset = [1, 2, 3];
+    const custom = customYears || !preset.includes(r.warrantyYears);
+    const seg = h('div', { class: 'seg' },
+      preset.map((y) => h('button', { class: !custom && r.warrantyYears === y ? 'on' : '', disabled: locked, onclick: () => { customYears = false; r.warrantyYears = y; persist(); drawBody(); } }, `${y} ${y === 1 ? 'rok' : 'roky'}`)),
+      h('button', { class: custom ? 'on' : '', disabled: locked, onclick: () => { customYears = true; drawBody(); } }, 'Iné'));
+    sec.append(seg);
+    if (custom) {
+      const yi = h('input', { type: 'number', min: '1', max: '30', step: '1', inputmode: 'numeric', 'aria-label': 'Počet rokov', disabled: locked });
+      yi.value = String(r.warrantyYears);
+      yi.addEventListener('input', () => { const n = parseInt(yi.value, 10); if (n >= 1 && n <= 30) { r.warrantyYears = n; autosave(); paintUntil(); } });
+      sec.append(h('div', { class: 'seg' }, yi, h('span', { class: 'meta' }, 'rokov')));
+    }
+    paintUntil();
+    sec.append(until, h('div', { class: 'foot' },
+      h('button', { class: 'btn small', onclick: async () => {
+        const f = buildIcs(r); if (!f) return;
+        if (navigator.canShare?.({ files: [f] })) { try { await navigator.share({ files: [f], title: f.name }); } catch { /* zrušené */ } }
+        else { const a = h('a', { href: URL.createObjectURL(f), download: f.name }); document.body.append(a); a.click(); a.remove(); }
+      } }, 'Pripomenúť v kalendári'),
+      !locked && h('button', { class: 'btn small', onclick: () => { r.warrantyYears = null; customYears = false; persist(); drawBody(); } }, 'Odstrániť záruku')));
+    return sec;
+  }
 
-  const itemsBox = r.items?.length
-    ? h('details', { class: 'items' }, h('summary', null, `Položky (${r.items.length})`),
-        h('ul', null, r.items.map((i) => h('li', null, h('span', null, `${i.qty}× ${i.name}${i.vatRate ? ` (${i.vatRate} %)` : ''}`), h('span', { class: 'num' }, money(i.price, r.currency))))))
-    : null;
+  function drawBody() {
+    body.replaceChildren();
+    const sections = [];
+
+    if (r.source === 'sk-qr') {
+      sections.push(official
+        ? h('div', { class: 'banner ok' }, 'Údaje boli načítané z finančnej správy.')
+        : h('div', { class: 'banner' }, RETRY_TEXT[r.lookup] || 'Údaje z eKasa sa nepodarilo načítať. Doplň ich ručne alebo skús znova.',
+            !locked && h('button', { class: 'btn small', onclick: (e) => retry(e.currentTarget) }, 'Skúsiť znova')));
+    }
+    if (official && r.vatCheck === false) sections.push(h('div', { class: 'banner' }, 'Súčet položiek nesedí s celkovou sumou. Skontroluj rozpis DPH.'));
+
+    /* Obchodník + dátum + suma */
+    if (editing) {
+      sections.push(h('section', { class: 'sec form' },
+        field('Predajca', 'vendor', { autocomplete: 'off' }),
+        field('Adresa predajcu', 'address', { autocomplete: 'off' }),
+        field('Dátum', 'date', { type: 'date' }),
+        field('Suma celkom', 'total', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr),
+        h('div', { class: 'grid2' },
+          field('z toho DPH', 'vat', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr),
+          r.source === 'sk-qr'
+            ? h('div', { class: 'field' }, h('label', null, 'Mena'), h('div', { class: 'fixedcur' }, 'EUR'))
+            : (() => {
+                const c = h('select', { id: 'f-currency', disabled: locked }, ['EUR', 'CZK', 'PLN', 'HUF', 'USD', 'GBP', 'CHF'].map((x) => h('option', { value: x }, x)));
+                c.value = r.currency; c.addEventListener('change', () => { r.currency = c.value; autosave(); drawHead(); });
+                return h('div', { class: 'field' }, h('label', { for: 'f-currency' }, 'Mena'), c);
+              })())));
+    } else {
+      sections.push(h('section', { class: 'sec' }, h('h3', null, 'Obchodník'),
+        h('strong', null, r.vendor), r.address && h('div', { class: 'meta' }, r.address),
+        h('h3', { class: 'gap' }, 'Dátum a čas vyhotovenia'),
+        h('div', null, `${fmtDate(r.date)}${r.time ? ' ' + r.time : ''}`),
+        !locked && h('div', { class: 'foot' }, h('button', { class: 'linkbtn', onclick: () => { editing = true; drawBody(); } }, 'Upraviť údaje'))));
+    }
+
+    sections.push(warrantySec());
+
+    const note = h('textarea', { id: 'f-note', rows: '2', disabled: locked, 'aria-label': 'Poznámka pre účtovníčku' }); note.value = r.note;
+    note.addEventListener('input', () => { r.note = note.value; autosave(); });
+    sections.push(h('section', { class: 'sec form' }, h('div', { class: 'field' }, h('label', { for: 'f-note' }, 'Poznámka pre účtovníčku'), note)));
+    sections.push(h('section', { class: 'sec' }, h('h3', null, 'Fotka bločku'), photoBox()));
+
+    if (r.items?.length) {
+      const list = showAllItems ? r.items : r.items.slice(0, 5);
+      sections.push(h('section', { class: 'sec' }, h('h3', null, `Položky (${r.items.length})`),
+        h('ul', { class: 'itemlist' }, list.map((i) => h('li', { class: i.total < 0 ? 'neg' : '' },
+          h('div', { class: 'nm' }, i.name),
+          h('div', { class: 'ln num' }, h('span', null, `${String(i.qty).replace('.', ',')} × ${money(i.unit, r.currency)}${i.vatRate ? ` · DPH ${i.vatRate} %` : ''}`), h('span', null, money(i.total, r.currency)))))),
+        r.items.length > 5 && h('div', { class: 'foot' }, h('button', { class: 'linkbtn', onclick: () => { showAllItems = !showAllItems; drawBody(); } }, showAllItems ? 'Zobraziť menej' : `Zobraziť ďalšie položky (${r.items.length - 5})`))));
+    }
+
+    /* Ostatné údaje */
+    const other = h('section', { class: 'sec' }, h('h3', null, 'Ostatné údaje'));
+    if (editing) {
+      other.append(h('div', { class: 'form' },
+        field('IČO', 'ico', { inputmode: 'numeric', autocomplete: 'off' }),
+        h('div', { class: 'grid2' }, field('DIČ', 'dic', { inputmode: 'numeric', autocomplete: 'off' }), field('IČ DPH', 'icDph', { autocomplete: 'off' }))));
+    } else {
+      other.append(kv([['Predajné miesto', r.unitAddress], ['DIČ', r.dic], ['IČ DPH', r.icDph], ['IČO', r.ico]]));
+    }
+    const tech = kv([['Kód pokladnice', r.cashRegisterCode], ['Poradové číslo', r.receiptNumber], ['ID bločku', r.receiptId], ['OKP', r.okp]]);
+    if (tech.children.length) { tech.classList.add('gap'); other.append(tech); }
+    if (r.ekasaRaw) other.append(h('div', { class: 'foot' }, h('button', { class: 'linkbtn', onclick: async () => {
+      try { await navigator.clipboard.writeText(JSON.stringify(r.ekasaRaw, null, 2)); toast('Technické dáta skopírované.'); } catch { toast('Kopírovanie sa nepodarilo.'); }
+    } }, 'Kopírovať technické dáta (JSON)')));
+    if (other.children.length > 1) sections.push(other);
+
+    /* Rozpis DPH */
+    if (r.vatBreakdown?.length) {
+      const sb = r.vatBreakdown.reduce((s, b) => s + b.base, 0), sv = r.vatBreakdown.reduce((s, b) => s + b.vat, 0);
+      sections.push(h('section', { class: 'sec' }, h('h3', null, 'Rozpis DPH'),
+        h('table', { class: 'vat num' },
+          h('thead', null, h('tr', null, h('th', null, 'Sadzba'), h('th', null, 'Bez DPH'), h('th', null, 'DPH'))),
+          h('tbody', null, r.vatBreakdown.map((b) => h('tr', null, h('td', null, `${b.rate} %`), h('td', null, money(b.base, r.currency)), h('td', null, money(b.vat, r.currency))))),
+          r.vatBreakdown.length > 1 && h('tfoot', null, h('tr', null, h('td', null, 'Spolu'), h('td', null, money(sb, r.currency)), h('td', null, money(sv, r.currency)))))));
+    }
+
+    if (!locked) sections.push(h('section', { class: 'sec' }, h('button', { class: 'btn danger', onclick: remove }, 'Zmazať bloček')));
+    body.append(...sections.filter(Boolean));
+  }
 
   function validate() {
     const e = {};
@@ -468,7 +682,7 @@ async function viewForm(id) {
     if (!(r.total > 0)) e.total = 'Doplň sumu väčšiu ako 0.';
     if (!r.photo && !r.receiptId) e.photo = 'Pridaj fotku bločku.';
     for (const k of Object.keys(errs)) errs[k].textContent = e[k] || '';
-    if (e.photo) toast(e.photo);
+    if (Object.keys(e).length) { toast(Object.values(e)[0]); if (!editing && (e.vendor || e.date || e.total)) { editing = true; drawBody(); } }
     return Object.keys(e).length === 0;
   }
   const setReady = async () => { if (!validate()) return; r.status = 'ready'; await persist(); selected.add(r.id); toast('Bloček je pripravený na odoslanie.'); history.back(); };
@@ -480,27 +694,15 @@ async function viewForm(id) {
     selected.delete(r.id); await db.del(r.id); history.back();
   };
 
+  drawHead(); drawBody();
   $app.append(
-    h('header', { class: 'hero compact' }, h('div', { class: 'wrap' },
+    h('header', { class: 'hero' }, h('div', { class: 'wrap' },
       h('div', { class: 'hero-top' },
         h('button', { class: 'ghost', onclick: () => history.back() }, '‹ Späť'),
-        h('span', { class: `chip ${r.status} onhero` }, STATUS[r.status])),
-      h('h1', { class: 'ttl' }, r.vendor || 'Nový bloček'))),
+        h('span', { class: `chip ${r.status} onhero` }, STATUS[r.status])))),
     h('main', { class: 'wrap content' },
       locked && h('div', { class: 'banner ok' }, `Odoslaný ${fmtDateTime(r.sentAt)}. Údaje sú zamknuté.`),
-      h('div', { class: 'form' },
-        lookupBanner,
-        field('Predajca', 'vendor', { autocomplete: 'off' }),
-        h('div', { class: 'grid2' }, field('Dátum', 'date', { type: 'date' }),
-          h('div', { class: 'field' }, h('label', { for: 'f-currency' }, 'Mena'), currency)),
-        h('div', { class: 'grid2' },
-          field('Suma celkom', 'total', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr),
-          field('z toho DPH', 'vat', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr)),
-        tax, itemsBox,
-        h('div', { class: 'field' }, h('label', null, 'Fotka bločku'), photoBox, errEl('photo')),
-        h('div', { class: 'field' }, h('label', { for: 'f-note' }, 'Poznámka pre účtovníčku'), note),
-        r.receiptId && h('p', { class: 'note' }, `ID dokladu: ${r.receiptId}`),
-        !locked && h('button', { class: 'btn danger', onclick: remove }, 'Zmazať bloček'))),
+      head, body),
     h('div', { class: 'dock' }, h('div', { class: 'wrap dock-in' },
       locked
         ? h('button', { class: 'btn primary grow', onclick: reopen }, 'Znovu otvoriť')

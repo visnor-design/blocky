@@ -1,6 +1,6 @@
 // Service worker: aplikácia funguje offline (app shell sa kešuje).
 // Pri každej zmene súborov zvýš VERSION, aby sa kešu obnovili.
-const VERSION = 'pokladna-v2';
+const VERSION = 'pokladna-v3';
 const SHELL = [
   './', 'index.html', 'styles.css', 'app.js', 'db.js', 'api.js', 'image.js', 'share.js',
   'vendor/jsQR.js', 'manifest.webmanifest',

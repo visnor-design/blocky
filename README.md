@@ -24,3 +24,11 @@ Nahraj celý priečinok na ľubovoľný statický hosting s HTTPS
 ## Bezpečnosť
 CSP v `index.html` povoľuje len vlastný pôvod a doménu eKasa.
 Žiadne kľúče ani prihlasovacie údaje v aplikácii.
+
+## Načítanie údajov zo slovenského bločku (eKasa)
+Prehliadač v telefóne zvyčajne nesmie volať finančnú správu priamo (CORS).
+Riešenie: malý prostredník `server/ekasa-proxy.js` (Cloudflare Worker, bezplatný plán).
+1. dash.cloudflare.com → Workers & Pages → Create → Hello World → vlož kód zo `server/ekasa-proxy.js` → Deploy.
+2. Settings → Variables: `ALLOWED_ORIGIN` = adresa appky, napr. `https://visnor-design.github.io`.
+3. V appke: Nastavenia → Adresa servera pre eKasa = adresa workera (https://...workers.dev).
+Ak použiješ inú doménu než *.workers.dev alebo *.supabase.co, pridaj ju do `connect-src` v `index.html`.
