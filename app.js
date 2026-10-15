@@ -196,7 +196,9 @@ async function viewList() {
       : [String(activeW.length), 'platných záruk', `${withW.length - activeW.length} vypršaných`];
 
   const hero = h('header', { class: 'hero' }, h('div', { class: 'wrap' },
-    h('div', { class: 'hero-top' }, h('h1', null, 'Bločky'), h('button', { class: 'ghost', onclick: openSettings }, 'Nastavenia')),
+    h('div', { class: 'hero-top' },
+      h('div', { class: 'brand' }, h('img', { class: 'logo', src: 'icons/logo.png', alt: 'Pastorkalt', width: '40', height: '36' }), h('h1', null, 'Bločky')),
+      h('button', { class: 'ghost', onclick: openSettings }, 'Nastavenia')),
     h('div', { class: 'big' }, h('span', { class: 'big-n num' }, big[0]), h('span', { class: 'big-l' }, big[1]), h('span', { class: 'big-s num' }, big[2])),
     h('div', { class: 'tabs', role: 'tablist' }, tab('todo', 'Aktuálne', todo.length), tab('sent', 'Odoslané', sent.length), tab('warranty', 'Záruky', withW.length))));
 

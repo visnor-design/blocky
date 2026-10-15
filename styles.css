@@ -258,3 +258,6 @@ dialog::backdrop { background: rgba(10,16,20,0.6); }
 h3.gap { margin: 16px 0 6px; }
 .sec.form { display: grid; gap: 14px; }
 .vat tbody td:first-child { font-weight: 650; }
+
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.logo { height: 34px; width: auto; display: block; flex: none; }
