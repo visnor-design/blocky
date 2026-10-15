@@ -1,8 +1,8 @@
 // Service worker: aplikácia funguje offline (app shell sa kešuje).
 // Pri každej zmene súborov zvýš VERSION, aby sa kešu obnovili.
-const VERSION = 'pokladna-v3';
+const VERSION = 'pokladna-v4';
 const SHELL = [
-  './', 'index.html', 'styles.css', 'app.js', 'db.js', 'api.js', 'image.js', 'share.js',
+  './', 'index.html', 'styles.css', 'app.js', 'db.js', 'api.js', 'image.js', 'share.js', 'theme.js',
   'vendor/jsQR.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'
 ];

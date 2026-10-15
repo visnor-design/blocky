@@ -56,6 +56,11 @@ const SKEY = 'blocky-settings';
 const getSettings = () => { try { return JSON.parse(localStorage.getItem(SKEY)) || {}; } catch { return {}; } };
 const setSettings = (s) => { try { localStorage.setItem(SKEY, JSON.stringify(s)); } catch { /* ignoruj */ } };
 
+function applyTheme(st) {
+  document.documentElement.dataset.accent = st.accent || 'teal';
+  document.documentElement.dataset.contrast = st.contrast || 'medium';
+}
+
 function newReceipt(source, extra = {}) {
   return {
     id: crypto.randomUUID(), createdAt: Date.now(), updatedAt: Date.now(),
@@ -301,18 +306,32 @@ function openSettings() {
   const to = h('input', { id: 's-to', type: 'email', autocomplete: 'off', placeholder: 'blocky@firma.sk' }); to.value = st.to || '';
   const url = h('input', { id: 's-url', type: 'url', autocomplete: 'off', placeholder: 'https://moj-proxy.workers.dev (nepovinné)' }); url.value = st.lookupUrl || '';
   const enh = h('input', { id: 's-enh', type: 'checkbox' }); enh.checked = st.enhance !== false;
-  const mode = (val, title, sub) => {
-    const i = h('input', { type: 'radio', name: 'sendmode', value: val }); i.checked = (st.sendMode || 'share') === val;
-    return h('label', { class: 'radio' }, i, h('span', null, title, h('small', null, sub)));
+  const radio = (group, val, title, sub, cur, onpick) => {
+    const i = h('input', { type: 'radio', name: group, value: val }); i.checked = cur === val;
+    if (onpick) i.addEventListener('change', onpick);
+    return h('label', { class: 'radio' }, i, h('span', null, title, sub && h('small', null, sub)));
   };
+  let accent = st.accent || 'teal', contrast = st.contrast || 'medium';
+  const preview = () => applyTheme({ accent, contrast });
+  const COLORS = [['teal', 'Tyrkysová'], ['blue', 'Modrá'], ['violet', 'Fialová'], ['green', 'Zelená'], ['terracotta', 'Terakota'], ['graphite', 'Grafit']];
+  const swatches = h('div', { class: 'swatches', role: 'radiogroup', 'aria-label': 'Farba' }, COLORS.map(([k, label]) => {
+    const i = h('input', { type: 'radio', name: 'accent', value: k, 'aria-label': label }); i.checked = accent === k;
+    i.addEventListener('change', () => { accent = k; preview(); });
+    return h('label', { class: `swatch sw-${k}`, title: label }, i);
+  }));
   const d = openDialog(h('div', { class: 'dlg-body' },
     h('h2', null, 'Nastavenia'),
     h('div', { class: 'form' },
       h('div', { class: 'field' }, h('label', { for: 's-name' }, 'Tvoje meno'), name),
       h('div', { class: 'field' }, h('label', { for: 's-to' }, 'Email účtovníčky'), to),
+      h('div', { class: 'field' }, h('label', null, 'Výraznosť vzhľadu'),
+        radio('contrast', 'strong', 'Výrazná', 'Hrubé obrysy, silný kontrast', contrast, () => { contrast = 'strong'; preview(); }),
+        radio('contrast', 'medium', 'Stredná', 'Tenšie obrysy', contrast, () => { contrast = 'medium'; preview(); }),
+        radio('contrast', 'soft', 'Jemná', 'Tenké linky, podobné detailu dokladu', contrast, () => { contrast = 'soft'; preview(); })),
+      h('div', { class: 'field' }, h('label', null, 'Farba'), swatches),
       h('div', { class: 'field' }, h('label', null, 'Spôsob odoslania'),
-        mode('share', 'Zdieľať s prílohami', 'Otvorí zoznam aplikácií (Mail, Outlook, Gmail). Prílohy sú pripojené automaticky.'),
-        mode('mailto', 'Stiahnuť súbory a otvoriť predvolenú poštu', 'Otvorí sa predvolená pošta s adresátom, prílohy pridáš ručne zo stiahnutých súborov.')),
+        radio('sendmode', 'share', 'Zdieľať s prílohami', 'Otvorí zoznam aplikácií (Mail, Outlook, Gmail). Prílohy sú pripojené automaticky.', st.sendMode || 'share'),
+        radio('sendmode', 'mailto', 'Stiahnuť súbory a otvoriť predvolenú poštu', 'Otvorí sa predvolená pošta s adresátom, prílohy pridáš ručne zo stiahnutých súborov.', st.sendMode || 'share')),
       h('div', { class: 'field' }, h('label', { for: 's-url' }, 'Adresa servera pre eKasa'), url,
         h('span', { class: 'note' }, 'Potrebné, ak telefón údaje zo slovenského bločku nevie načítať priamo.')),
       h('label', { class: 'check' }, enh, h('span', null, 'Zvýrazniť text na fotke (menší súbor, lepšie čitateľný)'))),
@@ -321,10 +340,11 @@ function openSettings() {
         const u = url.value.trim();
         if (u && !/^https:\/\//i.test(u)) return toast('Adresa servera musí začínať https://');
         const sm = d.querySelector('input[name=sendmode]:checked')?.value || 'share';
-        setSettings({ ...st, name: name.value.trim(), to: to.value.trim(), lookupUrl: u, sendMode: sm, enhance: enh.checked });
-        d.close(); toast('Nastavenia uložené.');
+        const next = { ...st, name: name.value.trim(), to: to.value.trim(), lookupUrl: u, sendMode: sm, enhance: enh.checked, accent, contrast };
+        setSettings(next); applyTheme(next); d.close(); toast('Nastavenia uložené.');
       } }, 'Uložiť'),
       h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť'))));
+  d.addEventListener('close', () => applyTheme(getSettings()));   // zrušenie vráti pôvodný vzhľad
 }
 
 /* ---------- odoslanie emailom ---------- */
@@ -505,7 +525,6 @@ async function viewForm(id) {
   const official = r.source === 'sk-qr' && r.lookup === 'ok';
   let editing = !official;       // údaje zo štátu sú predvolene len na čítanie
   let showAllItems = false;
-  let customYears = false;
   let saveTimer;
   const persist = () => { clearTimeout(saveTimer); r.updatedAt = Date.now(); return db.put(r); };
   const autosave = () => { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 400); };
@@ -533,20 +552,11 @@ async function viewForm(id) {
 
   /* fotka */
   const fileInput = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
-  const dlg = h('dialog', { class: 'lightbox' });
   fileInput.addEventListener('change', async () => {
     const f = fileInput.files[0]; if (!f) return;
     try { await persist(); pending = { bmp: await loadBitmap(f), target: r.id }; go('crop'); }
     catch { toast('Fotku sa nepodarilo načítať.'); }
   });
-  const photoBox = () => h('div', { class: 'photo' },
-    photoUrl && h('button', { class: 'thumbbtn', 'aria-label': 'Zobraziť fotku', onclick: () => {
-      dlg.replaceChildren(h('img', { src: photoUrl, alt: 'Fotka bločku', onclick: () => dlg.close() })); dlg.showModal();
-    } }, h('img', { class: 'thumb', src: photoUrl, alt: '' })),
-    photoUrl && h('span', { class: 'meta num' }, kb(r.photo.size)),
-    !locked && h('button', { class: 'btn small', onclick: () => fileInput.click() }, photoUrl ? 'Zmeniť fotku' : 'Pridať fotku'),
-    errEl('photo'));
-
   /* eKasa: opakované načítanie */
   async function retry(btn) {
     btn.disabled = true; btn.textContent = 'Načítavam…';
@@ -559,38 +569,75 @@ async function viewForm(id) {
     drawBody();
   }
 
-  function warrantySec() {
-    const sec = h('section', { class: 'sec' }, h('h3', null, 'Záruka'));
-    if (!r.warrantyYears) {
-      sec.append(h('button', { class: 'btn small', disabled: locked, onclick: () => { r.warrantyYears = 2; persist(); drawBody(); } }, 'Pridať záruku'));
-      return sec;
-    }
+  const yrs = (n) => `${n} ${n === 1 ? 'rok' : n >= 2 && n <= 4 ? 'roky' : 'rokov'}`;
+  const pill = (label, value, onclick, off) => h('button', { class: 'pill', onclick, disabled: off }, h('span', { class: 'pl' }, label), h('span', { class: 'pv' }, value));
+  const addTxt = () => h('span', { class: 'add' }, locked ? '—' : 'Pridať');
+
+  /* okno: záruka */
+  function openWarrantyDialog() {
+    let years = r.warrantyYears || 2;                 // predvolene 2 roky
+    let custom = !([1, 2, 3].includes(years));
+    const segBox = h('div');
     const until = h('p', { class: 'meta' });
     const paintUntil = () => {
-      const w = warrantyDate(r);
+      const w = warrantyDate({ ...r, warrantyYears: years });
       until.textContent = w ? `Platí do ${fmtDate(isoDate(w))} (${remaining(w).txt}). Počíta sa od dátumu bločku, ${fmtDate(r.date)}.` : '';
     };
-    const preset = [1, 2, 3];
-    const custom = customYears || !preset.includes(r.warrantyYears);
-    const seg = h('div', { class: 'seg' },
-      preset.map((y) => h('button', { class: !custom && r.warrantyYears === y ? 'on' : '', disabled: locked, onclick: () => { customYears = false; r.warrantyYears = y; persist(); drawBody(); } }, `${y} ${y === 1 ? 'rok' : 'roky'}`)),
-      h('button', { class: custom ? 'on' : '', disabled: locked, onclick: () => { customYears = true; drawBody(); } }, 'Iné'));
-    sec.append(seg);
-    if (custom) {
-      const yi = h('input', { type: 'number', min: '1', max: '30', step: '1', inputmode: 'numeric', 'aria-label': 'Počet rokov', disabled: locked });
-      yi.value = String(r.warrantyYears);
-      yi.addEventListener('input', () => { const n = parseInt(yi.value, 10); if (n >= 1 && n <= 30) { r.warrantyYears = n; autosave(); paintUntil(); } });
-      sec.append(h('div', { class: 'seg' }, yi, h('span', { class: 'meta' }, 'rokov')));
-    }
-    paintUntil();
-    sec.append(until, h('div', { class: 'foot' },
-      h('button', { class: 'btn small', onclick: async () => {
-        const f = buildIcs(r); if (!f) return;
-        if (navigator.canShare?.({ files: [f] })) { try { await navigator.share({ files: [f], title: f.name }); } catch { /* zrušené */ } }
-        else { const a = h('a', { href: URL.createObjectURL(f), download: f.name }); document.body.append(a); a.click(); a.remove(); }
-      } }, 'Pripomenúť v kalendári'),
-      !locked && h('button', { class: 'btn small', onclick: () => { r.warrantyYears = null; customYears = false; persist(); drawBody(); } }, 'Odstrániť záruku')));
-    return sec;
+    const paintSeg = () => {
+      segBox.replaceChildren(h('div', { class: 'seg' },
+        [1, 2, 3].map((y) => h('button', { class: !custom && years === y ? 'on' : '', disabled: locked, onclick: () => { custom = false; years = y; paintSeg(); } }, yrs(y))),
+        h('button', { class: custom ? 'on' : '', disabled: locked, onclick: () => { custom = true; paintSeg(); } }, 'Iné')));
+      if (custom) {
+        const yi = h('input', { type: 'number', min: '1', max: '30', step: '1', inputmode: 'numeric', 'aria-label': 'Počet rokov', disabled: locked });
+        yi.value = String(years);
+        yi.addEventListener('input', () => { const n = parseInt(yi.value, 10); if (n >= 1 && n <= 30) { years = n; paintUntil(); } });
+        segBox.append(h('div', { class: 'seg gap' }, yi, h('span', { class: 'meta' }, 'rokov')));
+      }
+      paintUntil();
+    };
+    paintSeg();
+    const d = openDialog(h('div', { class: 'dlg-body' }, h('h2', null, 'Záruka'), segBox, until,
+      h('div', { class: 'actions' },
+        !locked && h('button', { class: 'btn primary', onclick: async () => { r.warrantyYears = years; await persist(); d.close(); drawBody(); } }, 'Uložiť'),
+        h('button', { class: 'btn small', onclick: async () => {
+          const f = buildIcs({ ...r, warrantyYears: years }); if (!f) return;
+          if (navigator.canShare?.({ files: [f] })) { try { await navigator.share({ files: [f], title: f.name }); } catch { /* zrušené */ } }
+          else { const a = h('a', { href: URL.createObjectURL(f), download: f.name }); document.body.append(a); a.click(); a.remove(); }
+        } }, 'Pripomenúť v kalendári'),
+        !locked && r.warrantyYears && h('button', { class: 'btn small danger', onclick: async () => { r.warrantyYears = null; await persist(); d.close(); drawBody(); } }, 'Odstrániť záruku'),
+        h('button', { class: 'btn small', onclick: () => d.close() }, 'Zavrieť'))));
+  }
+
+  /* okno: poznámka */
+  function openNoteDialog() {
+    const ta = h('textarea', { 'aria-label': 'Poznámka pre účtovníčku', placeholder: 'Napíš poznámku pre účtovníčku', disabled: locked }); ta.value = r.note || '';
+    const d = openDialog(h('div', { class: 'dlg-body' }, h('h2', null, 'Poznámka pre účtovníčku'), ta,
+      h('div', { class: 'actions' },
+        !locked && h('button', { class: 'btn primary', onclick: async () => { r.note = ta.value.trim(); await persist(); d.close(); drawBody(); } }, 'Uložiť'),
+        !locked && r.note && h('button', { class: 'btn small danger', onclick: async () => { r.note = ''; await persist(); d.close(); drawBody(); } }, 'Vymazať poznámku'),
+        h('button', { class: 'btn small', onclick: () => d.close() }, 'Zavrieť'))));
+    if (!locked) ta.focus();
+  }
+
+  /* okno: fotka */
+  function openPhotoDialog() {
+    const d = openDialog(h('div', { class: 'dlg-body' }, h('h2', null, 'Fotka bločku'),
+      photoUrl && h('img', { class: 'bigphoto', src: photoUrl, alt: 'Fotka bločku' }),
+      photoUrl && h('p', { class: 'meta num' }, kb(r.photo.size)),
+      h('div', { class: 'actions' },
+        !locked && h('button', { class: 'btn primary', onclick: () => { d.close(); fileInput.click(); } }, photoUrl ? 'Zmeniť fotku' : 'Pridať fotku'),
+        !locked && photoUrl && h('button', { class: 'btn small danger', onclick: async () => { URL.revokeObjectURL(photoUrl); photoUrl = null; r.photo = null; await persist(); d.close(); drawBody(); } }, 'Odstrániť fotku'),
+        h('button', { class: 'btn small', onclick: () => d.close() }, 'Zavrieť'))));
+  }
+
+  function pillsSec() {
+    const w = warrantyDate(r);
+    return h('section', { class: 'pills' },
+      pill('Záruka', r.warrantyYears && w ? h('span', null, `${yrs(r.warrantyYears)} · do ${fmtDate(isoDate(w))}`) : addTxt(), openWarrantyDialog, locked && !r.warrantyYears),
+      pill('Poznámka', r.note ? h('span', { class: 'clip' }, r.note) : addTxt(), openNoteDialog, locked && !r.note),
+      pill('Fotka bločku', photoUrl ? [h('img', { class: 'minithumb', src: photoUrl, alt: '' }), h('span', { class: 'num' }, kb(r.photo.size))] : addTxt(),
+        () => (photoUrl || locked ? openPhotoDialog() : fileInput.click()), locked && !photoUrl),
+      errEl('photo'));
   }
 
   function drawBody() {
@@ -629,12 +676,7 @@ async function viewForm(id) {
         !locked && h('div', { class: 'foot' }, h('button', { class: 'linkbtn', onclick: () => { editing = true; drawBody(); } }, 'Upraviť údaje'))));
     }
 
-    sections.push(warrantySec());
-
-    const note = h('textarea', { id: 'f-note', rows: '2', disabled: locked, 'aria-label': 'Poznámka pre účtovníčku' }); note.value = r.note;
-    note.addEventListener('input', () => { r.note = note.value; autosave(); });
-    sections.push(h('section', { class: 'sec form' }, h('div', { class: 'field' }, h('label', { for: 'f-note' }, 'Poznámka pre účtovníčku'), note)));
-    sections.push(h('section', { class: 'sec' }, h('h3', null, 'Fotka bločku'), photoBox()));
+    sections.push(pillsSec());
 
     if (r.items?.length) {
       const list = showAllItems ? r.items : r.items.slice(0, 5);
@@ -709,12 +751,13 @@ async function viewForm(id) {
         : r.status === 'ready'
           ? h('button', { class: 'btn grow', onclick: setDraft }, 'Vrátiť medzi rozpracované')
           : h('button', { class: 'btn primary grow', onclick: setReady }, 'Pripravený na odoslanie'))),
-    fileInput, dlg);
+    fileInput);
 }
 
 /* ---------- štart ---------- */
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
+applyTheme(getSettings());
 history.replaceState({ view: 'list', params: {} }, '');
 render({ view: 'list', params: {} });
