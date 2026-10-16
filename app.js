@@ -1,7 +1,7 @@
 import * as db from './db.js';
 import * as api from './api.js';
 import { loadBitmap, autoDetect, renderCrop, mountCropper } from './image.js';
-import { buildBatch, shareBatch, warrantyDate, isoDate, buildIcs } from './share.js';
+import { buildBatch, fitBatch, shareBatch, warrantyDate, isoDate, buildIcs } from './share.js';
 
 /* ---------- pomocné funkcie ---------- */
 function h(tag, props, ...kids) {
@@ -204,7 +204,7 @@ async function viewList() {
 
   /* filter */
   const listBox = h('div');
-  const dockBox = h('div');
+  const dockBox = h('div', { class: 'dockhost' });
   const infoBox = h('p', { class: 'filterinfo num' });
   const filterBtn = h('button', { class: 'btn small', onclick: () => { filtersOpen = !filtersOpen; full(); } }, filtersOpen ? 'Skryť filter' : 'Filter' + (filtersActive() ? ' •' : ''));
   const search = h('input', { class: 'search', type: 'search', placeholder: 'Hľadať bloček', 'aria-label': 'Hľadať' });
@@ -308,6 +308,7 @@ function openSettings() {
   const to = h('input', { id: 's-to', type: 'email', autocomplete: 'off', placeholder: 'blocky@firma.sk' }); to.value = st.to || '';
   const url = h('input', { id: 's-url', type: 'url', autocomplete: 'off', placeholder: 'https://moj-proxy.workers.dev (nepovinné)' }); url.value = st.lookupUrl || '';
   const enh = h('input', { id: 's-enh', type: 'checkbox' }); enh.checked = st.enhance !== false;
+  const auto = h('input', { id: 's-auto', type: 'checkbox' }); auto.checked = st.autoPhoto !== false;
   const radio = (group, val, title, sub, cur, onpick) => {
     const i = h('input', { type: 'radio', name: group, value: val }); i.checked = cur === val;
     if (onpick) i.addEventListener('change', onpick);
@@ -336,13 +337,14 @@ function openSettings() {
         radio('sendmode', 'mailto', 'Stiahnuť súbory a otvoriť predvolenú poštu', 'Otvorí sa predvolená pošta s adresátom, prílohy pridáš ručne zo stiahnutých súborov.', st.sendMode || 'share')),
       h('div', { class: 'field' }, h('label', { for: 's-url' }, 'Adresa servera pre eKasa'), url,
         h('span', { class: 'note' }, 'Potrebné, ak telefón údaje zo slovenského bločku nevie načítať priamo.')),
+      h('label', { class: 'check' }, auto, h('span', null, 'Po naskenovaní QR kódu hneď odfotiť bloček')),
       h('label', { class: 'check' }, enh, h('span', null, 'Zvýrazniť text na fotke (menší súbor, lepšie čitateľný)'))),
     h('div', { class: 'actions' },
       h('button', { class: 'btn primary', onclick: () => {
         const u = url.value.trim();
         if (u && !/^https:\/\//i.test(u)) return toast('Adresa servera musí začínať https://');
         const sm = d.querySelector('input[name=sendmode]:checked')?.value || 'share';
-        const next = { ...st, name: name.value.trim(), to: to.value.trim(), lookupUrl: u, sendMode: sm, enhance: enh.checked, accent, contrast };
+        const next = { ...st, name: name.value.trim(), to: to.value.trim(), lookupUrl: u, sendMode: sm, enhance: enh.checked, autoPhoto: auto.checked, accent, contrast };
         setSettings(next); applyTheme(next); d.close(); toast('Nastavenia uložené.');
       } }, 'Uložiť'),
       h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť'))));
@@ -352,15 +354,22 @@ function openSettings() {
 /* ---------- odoslanie emailom ---------- */
 async function openSendSheet(ids, resend = false) {
   const all = await db.all();
-  const rs = all.filter((r) => ids.includes(r.id) && (resend ? r.status === 'sent' : r.status === 'ready'));
+  let rs = all.filter((r) => ids.includes(r.id) && (resend ? r.status === 'sent' : r.status === 'ready'));
   if (!rs.length) return toast('Nie je čo odoslať.');
   const st = getSettings();
-  const batch = buildBatch(rs, st);
   const mailto = st.sendMode === 'mailto';
+  let batch, trimmed = 0, nFiles = 0;
+  if (mailto) { batch = buildBatch(rs, st); nFiles = batch.altFiles.length; }
+  else {
+    // Android dovolí naraz najviac 10 príloh. Poslať sa dá toľko bločkov, koľko telefón povolí.
+    const fit = fitBatch(rs, st);
+    batch = fit.batch; nFiles = fit.count_files; trimmed = rs.length - fit.count; rs = rs.slice(0, fit.count);
+  }
 
   const d = openDialog(h('div', { class: 'dlg-body' },
     h('h2', null, `Odoslať ${rs.length} ${plural(rs.length)}`),
-    h('p', { class: 'num' }, `${batch.sum} · ${batch.files.length} príloh · ${kb(batch.totalBytes)}`),
+    h('p', { class: 'num' }, `${batch.sum} · ${nFiles} príloh · ${kb(batch.totalBytes)}`),
+    trimmed > 0 && h('p', { class: 'banner' }, `Tento telefón dovolí poslať naraz najviac ${rs.length} ${plural(rs.length)}. Odošlú sa prvé, ďalších ${trimmed} ostane pripravených na ďalší email.`),
     batch.totalBytes > 20 * 1048576 && h('p', { class: 'banner' }, 'Prílohy majú viac ako 20 MB. Niektoré pošty ich neodošlú. Rozdeľ odosielanie na menej bločkov.'),
     h('div', { class: 'addr' },
       h('div', null, h('div', { class: 'meta' }, 'Adresát'), h('strong', null, st.to || 'nie je nastavený (Nastavenia)')),
@@ -373,11 +382,12 @@ async function openSendSheet(ids, resend = false) {
         const res = await shareBatch({ ...batch, to: st.to, mode: st.sendMode });   // hneď po kliknutí
         d.close();
         if (res.status === 'cancelled') return;
-        if (res.status === 'error') return toast('Odoslanie zlyhalo. Skús to znova.');
-        if (res.droppedJson) toast('Tento telefón nepovolil prílohy .json, odišli len fotky a súhrn.', 5000);
+        if (res.note) toast(res.note, 6000);
         const ok = await confirmDialog({
           title: 'Odoslal si email?',
-          text: res.status === 'fallback' ? 'Súbory sa stiahli. Pripoj ich k emailu a odošli ho. Potom bločky označím ako odoslané.' : 'Ak si email odoslal, označím tieto bločky ako odoslané.',
+          text: res.status === 'fallback'
+            ? `${res.failure ? `Zdieľanie zlyhalo (${res.failure}). ` : ''}Súbory sa stiahli a otvorila sa pošta. Pripoj stiahnuté súbory k emailu a odošli ho. Potom bločky označím ako odoslané.`
+            : 'Ak si email odoslal, označím tieto bločky ako odoslané.',
           yes: 'Áno, odoslané', no: 'Nie, ešte nie',
         });
         if (!ok) return;
@@ -392,23 +402,55 @@ async function openSendSheet(ids, resend = false) {
 /* ---------- skener ---------- */
 function viewScan() {
   let active = true, stream = null, raf = 0, busy = false;
+  let rcpt = null;                 // bloček uložený po QR, ku ktorému sa pridá fotka
   const video = h('video', { playsinline: true, autoplay: true });
   video.muted = true;
   const fileInput = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
-  const hint = h('div', { class: 'hint' }, 'Namier kameru na QR kód na bločku');
+  const hint = h('div', { class: 'hint' });
+  const frame = h('div', { class: 'frame' });
+  const barBox = h('div', { class: 'bar' });
   const overlay = h('div', { class: 'scan' });
   const stop = () => { active = false; cancelAnimationFrame(raf); if (stream) stream.getTracks().forEach((t) => t.stop()); };
   cleanup = stop;
 
+  const toCrop = async (bmp) => {
+    pending = { bmp, target: rcpt ? rcpt.id : null, next: rcpt ? 'form' : null };
+    stop(); go('crop', {}, { replace: true });
+  };
   fileInput.addEventListener('change', async () => {
     const f = fileInput.files[0];
     if (!f) return;
     busy = true; hint.textContent = 'Načítavam fotku…';
-    try { pending = { bmp: await loadBitmap(f), target: null }; stop(); go('crop', {}, { replace: true }); }
+    try { await toCrop(await loadBitmap(f)); }
     catch { busy = false; hint.textContent = 'Fotku sa nepodarilo načítať. Skús znova.'; }
   });
 
   const manual = async () => { const r = newReceipt('manual'); await db.put(r); stop(); go('form', { id: r.id }, { replace: true }); };
+  const openForm = (r) => { stop(); go('form', { id: r.id }, { replace: true }); };
+
+  // Zábery z živej kamery (bez otvárania systémovej aplikácie fotoaparátu).
+  async function capture() {
+    if (!video.videoWidth) return toast('Kamera ešte nie je pripravená.');
+    const c = document.createElement('canvas');
+    c.width = video.videoWidth; c.height = video.videoHeight;
+    c.getContext('2d').drawImage(video, 0, 0);
+    if (navigator.vibrate) navigator.vibrate(40);
+    try { await toCrop(await createImageBitmap(c)); } catch { toast('Fotku sa nepodarilo vytvoriť.'); }
+  }
+
+  function setMode(mode, msg) {
+    const photo = mode === 'photo';
+    busy = photo;
+    frame.className = 'frame' + (photo ? ' tall' : '');
+    hint.className = 'hint' + (photo ? ' top' : '');
+    hint.textContent = msg || 'Namier kameru na QR kód na bločku';
+    barBox.replaceChildren(...(photo
+      ? [h('button', { class: 'btn signal', onclick: capture }, rcpt ? 'Odfotiť bloček' : 'Odfotiť'),
+         rcpt ? h('button', { class: 'btn', onclick: () => openForm(rcpt) }, 'Preskočiť fotku')
+              : h('button', { class: 'btn', onclick: () => setMode('qr') }, 'Späť na QR kód')]
+      : [h('button', { class: 'btn signal', onclick: () => setMode('photo', 'Odfoť celý bloček tak, aby bol celý v zábere') }, 'Odfotiť zahraničný bloček'),
+         h('button', { class: 'btn', onclick: manual }, 'Zadať ručne')]));
+  }
 
   async function onCode(text) {
     busy = true;
@@ -416,7 +458,7 @@ function viewScan() {
     const rid = api.parseEkasaQr(text);
     if (!rid) {
       hint.textContent = 'Toto nie je QR kód slovenského bločku. Skús iný alebo odfoť bloček.';
-      setTimeout(() => { busy = false; hint.textContent = 'Namier kameru na QR kód na bločku'; }, 2200);
+      setTimeout(() => { if (mode0()) busy = false; hint.textContent = 'Namier kameru na QR kód na bločku'; }, 2200);
       return;
     }
     const dup = await db.findByReceiptId(rid);
@@ -428,8 +470,14 @@ function viewScan() {
     clearTimeout(t);
     const r = newReceipt('sk-qr', { receiptId: rid });
     if (res.ok) Object.assign(r, res.data, { lookup: 'ok' }); else r.lookup = res.reason;
-    await db.put(r); stop(); go('form', { id: r.id }, { replace: true });
+    await db.put(r);
+    rcpt = r;
+    if (getSettings().autoPhoto !== false && active) {
+      // Kamera už beží, rovno ponúkneme odfotenie bločku.
+      setMode('photo', res.ok ? 'Údaje načítané. Teraz odfoť celý bloček.' : 'QR kód uložený. Teraz odfoť celý bloček.');
+    } else openForm(r);
   }
+  const mode0 = () => !rcpt && !hint.classList.contains('top');   // sme v režime QR
 
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -447,12 +495,10 @@ function viewScan() {
     raf = requestAnimationFrame(tick);
   }
 
-  const bar = h('div', { class: 'bar' },
-    h('button', { class: 'btn signal', onclick: () => fileInput.click() }, 'Odfotiť zahraničný bloček'),
-    h('button', { class: 'btn', onclick: manual }, 'Zadať ručne'));
   const close = h('button', { class: 'btn small close', onclick: () => history.back() }, 'Zavrieť');
-  overlay.append(video, h('div', { class: 'frame' }), hint, close, bar, fileInput);
+  overlay.append(video, frame, hint, close, barBox, fileInput);
   $app.append(overlay);
+  setMode('qr');
 
   const cameraError = (text) => {
     hint.textContent = '';
@@ -462,7 +508,7 @@ function viewScan() {
       h('button', { class: 'btn', onclick: () => history.back() }, 'Späť')));
   };
   if (!navigator.mediaDevices?.getUserMedia) return cameraError('Tento prehliadač nepodporuje prístup ku kamere.');
-  navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
     .then((s) => {
       if (!active) { s.getTracks().forEach((t) => t.stop()); return; }
       stream = s; video.srcObject = s;
@@ -476,11 +522,12 @@ function viewScan() {
 /* ---------- orezanie fotky ---------- */
 function viewCrop() {
   if (!pending) return go('list', {}, { replace: true });
-  const { bmp, target } = pending;
+  const { bmp, target, next } = pending;
   let enhance = getSettings().enhance !== false;
   const stage = h('div', { class: 'stage' });
   const cropper = mountCropper(stage, bmp, autoDetect(bmp));
   cleanup = () => cropper.destroy();
+  const backToForm = () => go('form', { id: target }, { replace: true });
 
   const enh = h('input', { type: 'checkbox' }); enh.checked = enhance;
   enh.addEventListener('change', () => { enhance = enh.checked; });
@@ -494,7 +541,7 @@ function viewCrop() {
         const r = await db.get(target);
         if (r) { r.photo = blob; r.updatedAt = Date.now(); await db.put(r); }
         toast(`Fotka uložená (${kb(blob.size)}).`);
-        history.back();
+        next === 'form' ? backToForm() : history.back();
       } else {
         const r = newReceipt('photo', { photo: blob });
         await db.put(r);
@@ -510,7 +557,7 @@ function viewCrop() {
     h('div', { class: 'bar' },
       h('label', { class: 'check light' }, enh, h('span', null, 'Zvýrazniť text')),
       useBtn,
-      h('button', { class: 'btn', onclick: () => { pending = null; history.back(); } }, 'Zrušiť'))));
+      h('button', { class: 'btn', onclick: () => { pending = null; next === 'form' ? backToForm() : history.back(); } }, next === 'form' ? 'Preskočiť fotku' : 'Zrušiť'))));
 }
 
 /* ---------- detail bločku ---------- */

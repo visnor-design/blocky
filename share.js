@@ -46,6 +46,8 @@ export function buildIcs(r) {
 
 export function buildBatch(receipts, settings = {}) {
   const files = [];
+  const photos = [];
+  const jsons = [];
   const rows = [['subor', 'datum', 'predajca', 'ico', 'dic', 'ic_dph', 'suma', 'dph', 'mena', 'rozpis_dph', 'zaruka_do', 'zdroj', 'ekasa_id', 'poznamka'].join(';')];
   const lines = [];
   const totals = {};
@@ -54,7 +56,7 @@ export function buildBatch(receipts, settings = {}) {
   receipts.forEach((r, i) => {
     const base = `${String(i + 1).padStart(2, '0')}_${r.date || 'bez-datumu'}_${slug(r.vendor)}_${String(r.total ?? 0).replace('.', '-')}${r.currency}`;
     const photoName = r.photo ? base + '.jpg' : null;
-    if (r.photo) files.push(new File([r.photo], photoName, { type: 'image/jpeg' }));
+    if (r.photo) { const pf = new File([r.photo], photoName, { type: 'image/jpeg' }); files.push(pf); photos.push(pf); }
     const json = {
       schema: 'blocek/1',
       id: r.id,
@@ -74,6 +76,7 @@ export function buildBatch(receipts, settings = {}) {
       photoFile: photoName,
       ekasaRaw: r.ekasaRaw || null,
     };
+    jsons.push(json);
     files.push(new File([JSON.stringify(json, null, 2)], base + '.json', { type: 'application/json' }));
     rows.push([photoName || base + '.json', r.date, csvText(r.vendor), csvText(r.ico), csvText(r.dic), csvText(r.icDph),
       csvNum(r.total), csvNum(r.vat), r.currency,
@@ -83,7 +86,12 @@ export function buildBatch(receipts, settings = {}) {
     totals[r.currency] = (totals[r.currency] || 0) + (r.total || 0);
   });
 
-  files.push(new File(['\uFEFF' + rows.join('\r\n')], 'suhrn.csv', { type: 'text/csv' }));
+  const csv = new File(['\uFEFF' + rows.join('\r\n')], 'suhrn.csv', { type: 'text/csv' });
+  files.push(csv);
+  // Android Chrome nepovolí .json a naraz najviac 10 súborov: záložné zostavy.
+  const combined = new File([JSON.stringify(jsons, null, 2)], 'blocky-data.txt', { type: 'text/plain' });
+  const altFiles = [...photos, csv, combined];   // údaje v jednom textovom súbore
+  const minFiles = [...photos, csv];             // len fotky a súhrn
 
   const sum = Object.entries(totals).map(([c, v]) => money(v, c)).join(' + ');
   const when = skDate(new Date().toLocaleDateString('sv-SE'));
@@ -98,37 +106,65 @@ export function buildBatch(receipts, settings = {}) {
     'Prílohy: fotky (.jpg), údaje (.json) a súhrn (.csv).',
   ].join('\n');
 
-  return { files, subject, text, sum, totalBytes: files.reduce((s, f) => s + f.size, 0) };
+  return { files, altFiles, minFiles, subject, text, sum, totalBytes: files.reduce((s, f) => s + f.size, 0) };
 }
 
 const retypeJson = (f) => (f.name.endsWith('.json') ? new File([f], f.name, { type: 'text/plain' }) : f);
 
-// Musí sa volať priamo z kliknutia (bez čakania pred volaním), inak ho iOS zamietne.
-export async function shareBatch({ files, subject, text, to, mode }) {
+// Zostavy príloh od najúplnejšej po najjednoduchšiu; použije sa prvá, ktorú telefón povolí.
+function variants(b) {
+  return [
+    { list: b.files, note: '' },
+    { list: b.files.map(retypeJson), note: '' },
+    { list: b.altFiles, note: 'Tento telefón nepovolil súbory .json, údaje sú v jednom súbore blocky-data.txt.' },
+    { list: b.minFiles, note: 'Tento telefón nepovolil prílohy s údajmi, odišli len fotky a súhrn (.csv).' },
+  ];
+}
+const canShareList = (list) => navigator.canShare({ files: list });
+const firstOk = (b, n) => variants(b).slice(0, n).find((v) => canShareList(v.list));
+const noShareApi = () => !(navigator.share && navigator.canShare);
+
+// Nájde najväčší počet bločkov, ktorý telefón dovolí poslať naraz (Android: max 10 súborov, bez .json).
+// Uprednostní zostavu s údajmi (json alebo blocky-data.txt) pred väčším počtom bločkov bez údajov.
+export function fitBatch(receipts, settings) {
+  if (noShareApi()) { const batch = buildBatch(receipts, settings); return { batch, count: receipts.length, count_files: batch.files.length }; }
+  for (const n of [3, 4]) {
+    for (let k = receipts.length; k >= 1; k--) {
+      const batch = buildBatch(receipts.slice(0, k), settings);
+      const v = firstOk(batch, n);
+      if (v) return { batch, count: k, count_files: v.list.length };
+    }
+  }
+  const batch = buildBatch(receipts.slice(0, 1), settings);
+  return { batch, count: 1, count_files: batch.files.length };
+}
+
+// Musí sa volať priamo z kliknutia (bez čakania pred volaním), inak ho prehliadač zamietne.
+export async function shareBatch(batch) {
+  const { subject, text, to, mode } = batch;
+  let failure = '';
   if (mode !== 'mailto' && navigator.share && navigator.canShare) {
-    const variants = [
-      { list: files, droppedJson: false },
-      { list: files.map(retypeJson), droppedJson: false },
-      { list: files.filter((f) => !f.name.endsWith('.json')), droppedJson: true },
-    ];
-    for (const v of variants) {
+    for (const v of variants(batch)) {
       if (!navigator.canShare({ files: v.list })) continue;
       try {
         await navigator.share({ files: v.list, title: subject, text });
-        return { status: 'shared', droppedJson: v.droppedJson };
+        return { status: 'shared', note: v.note };
       } catch (e) {
-        return e.name === 'AbortError' ? { status: 'cancelled' } : { status: 'error', error: e };
+        if (e.name === 'AbortError') return { status: 'cancelled' };
+        failure = e.name || 'chyba';   // iná chyba: skúsime záložný postup nižšie
+        break;
       }
     }
   }
-  // Záloha (napr. počítač): stiahnuť súbory a otvoriť prázdny email.
-  for (const f of files) {
+  // Záloha: stiahnuť súbory a otvoriť email s adresátom (prílohy sa pridajú ručne).
+  const list = batch.altFiles || batch.files;
+  for (const f of list) {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(f); a.download = f.name;
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 300));
   }
   location.href = `mailto:${encodeURIComponent(to || '')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`;
-  return { status: 'fallback' };
+  return { status: 'fallback', failure };
 }

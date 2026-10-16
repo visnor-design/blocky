@@ -82,7 +82,8 @@ button { cursor: pointer; }
 :focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
 .num { font-variant-numeric: tabular-nums; }
 .wrap { max-width: 560px; margin: 0 auto; padding: 0 18px; }
-#app { min-height: 100vh; }
+#app { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
+.dockhost { display: contents; }
 
 /* Hlavička */
 .hero { background: var(--hero); padding: calc(10px + env(safe-area-inset-top)) 0 0; border-bottom: var(--heroline); }
@@ -99,7 +100,7 @@ button { cursor: pointer; }
 .tab .count { background: var(--hair); color: var(--ink); border-radius: 99px; padding: 0 8px; font-size: 0.82rem; }
 .tab.on .count { background: var(--ink-soft); color: var(--ground); }
 
-.content { padding-top: 16px; padding-bottom: 130px; }
+.content { flex: 1; width: 100%; padding-top: 16px; padding-bottom: 28px; }
 .install { background: var(--signal); color: #16222A; border-radius: var(--radius); padding: 12px 14px; margin-bottom: 14px; display: flex; gap: 10px; justify-content: space-between; font-size: 0.95rem; font-weight: 550; }
 .install button { border: 0; background: none; font-weight: 800; padding: 0 4px; color: inherit; }
 
@@ -151,7 +152,7 @@ button { cursor: pointer; }
 .btn.small { min-height: 42px; padding: 0 14px; font-size: 0.93rem; }
 .btn.grow { flex: 1; }
 .btn[disabled] { opacity: 0.55; }
-.dock { position: fixed; left: 0; right: 0; bottom: 0; background: var(--ground); border-top: var(--dockline); padding: 12px 0 calc(12px + env(safe-area-inset-bottom)); z-index: 5; }
+.dock { position: sticky; bottom: 0; margin-top: auto; background: var(--ground); border-top: var(--dockline); padding: 12px 0 calc(12px + env(safe-area-inset-bottom)); z-index: 5; }
 .dock-in { display: flex; gap: 10px; }
 .actions { display: grid; gap: 10px; margin-top: 16px; }
 .note { color: var(--ink-soft); font-size: 0.9rem; margin: 6px 0 0; }
@@ -261,3 +262,7 @@ h3.gap { margin: 16px 0 6px; }
 
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .logo { height: 34px; width: auto; display: block; flex: none; }
+
+/* Fotenie bločku v živej kamere */
+.scan .frame.tall { width: min(66vw, 280px); aspect-ratio: 3 / 4; top: 46%; border-radius: 16px; }
+.scan .hint.top { top: calc(16px + env(safe-area-inset-top)); padding: 0 120px 0 20px; text-align: left; }
