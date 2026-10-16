@@ -266,3 +266,13 @@ h3.gap { margin: 16px 0 6px; }
 /* Fotenie bločku v živej kamere */
 .scan .frame.tall { width: min(66vw, 280px); aspect-ratio: 3 / 4; top: 46%; border-radius: 16px; }
 .scan .hint.top { top: calc(16px + env(safe-area-inset-top)); padding: 0 120px 0 20px; text-align: left; }
+
+.hero-actions { display: flex; align-items: center; gap: 8px; }
+.ghost.danger { color: var(--danger); border-color: var(--danger); }
+.paid { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 0 0 12px; }
+.paid span { font-weight: 650; color: var(--ink-soft); }
+.paid strong { font-size: 1.4rem; letter-spacing: -0.02em; }
+.vat th, .vat td { padding-left: 6px; }
+.vat th:first-child, .vat td:first-child { padding-left: 0; }
+.verline { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 14px; }
+.pills { margin-bottom: 8px; }

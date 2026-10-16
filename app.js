@@ -3,6 +3,8 @@ import * as api from './api.js';
 import { loadBitmap, autoDetect, renderCrop, mountCropper } from './image.js';
 import { buildBatch, fitBatch, shareBatch, warrantyDate, isoDate, buildIcs } from './share.js';
 
+const APP_VERSION = '7';
+
 /* ---------- pomocné funkcie ---------- */
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -347,7 +349,13 @@ function openSettings() {
         const next = { ...st, name: name.value.trim(), to: to.value.trim(), lookupUrl: u, sendMode: sm, enhance: enh.checked, autoPhoto: auto.checked, accent, contrast };
         setSettings(next); applyTheme(next); d.close(); toast('Nastavenia uložené.');
       } }, 'Uložiť'),
-      h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť'))));
+      h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť')),
+    h('div', { class: 'verline' },
+      h('span', { class: 'meta' }, `Verzia ${APP_VERSION}`),
+      h('button', { class: 'linkbtn', onclick: async () => {
+        try { const reg = await navigator.serviceWorker?.getRegistration(); await reg?.update(); } catch { /* offline */ }
+        location.reload();
+      } }, 'Skontrolovať aktualizáciu'))));
   d.addEventListener('close', () => applyTheme(getSettings()));   // zrušenie vráti pôvodný vzhľad
 }
 
@@ -689,6 +697,35 @@ async function viewForm(id) {
       errEl('photo'));
   }
 
+  /* Sumy a DPH: celková zaplatená suma + rozpis podľa sadzieb */
+  function amountsSec() {
+    const sec = h('section', { class: 'sec' }, h('h3', null, 'Sumy a DPH'));
+    if (editing) {
+      sec.append(h('div', { class: 'form' },
+        field('Celkom zaplatené', 'total', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr),
+        h('div', { class: 'grid2' },
+          field('z toho DPH', 'vat', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr),
+          r.source === 'sk-qr'
+            ? h('div', { class: 'field' }, h('label', null, 'Mena'), h('div', { class: 'fixedcur' }, 'EUR'))
+            : (() => {
+                const c = h('select', { id: 'f-currency', disabled: locked }, ['EUR', 'CZK', 'PLN', 'HUF', 'USD', 'GBP', 'CHF'].map((x) => h('option', { value: x }, x)));
+                c.value = r.currency; c.addEventListener('change', () => { r.currency = c.value; autosave(); drawHead(); });
+                return h('div', { class: 'field' }, h('label', { for: 'f-currency' }, 'Mena'), c);
+              })())));
+    } else {
+      sec.append(h('div', { class: 'paid' }, h('span', null, 'Celkom zaplatené'), h('strong', { class: 'num' }, money(r.total, r.currency))));
+      if (!r.vatBreakdown?.length && r.vat != null) sec.append(kv([['z toho DPH', money(r.vat, r.currency)]]));
+    }
+    if (r.vatBreakdown?.length) {
+      const sb = r.vatBreakdown.reduce((x, b) => x + b.base, 0), sv = r.vatBreakdown.reduce((x, b) => x + b.vat, 0);
+      sec.append(h('table', { class: 'vat num' },
+        h('thead', null, h('tr', null, h('th', null, 'Sadzba'), h('th', null, 'Bez DPH'), h('th', null, 'DPH'), h('th', null, 'S DPH'))),
+        h('tbody', null, r.vatBreakdown.map((b) => h('tr', null, h('td', null, `${b.rate} %`), h('td', null, money(b.base, r.currency)), h('td', null, money(b.vat, r.currency)), h('td', null, money(b.base + b.vat, r.currency))))),
+        r.vatBreakdown.length > 1 && h('tfoot', null, h('tr', null, h('td', null, 'Spolu'), h('td', null, money(sb, r.currency)), h('td', null, money(sv, r.currency)), h('td', null, money(sb + sv, r.currency))))));
+    }
+    return sec;
+  }
+
   function drawBody() {
     body.replaceChildren();
     const sections = [];
@@ -701,22 +738,12 @@ async function viewForm(id) {
     }
     if (official && r.vatCheck === false) sections.push(h('div', { class: 'banner' }, 'Súčet položiek nesedí s celkovou sumou. Skontroluj rozpis DPH.'));
 
-    /* Obchodník + dátum + suma */
+    /* Obchodník + dátum */
     if (editing) {
       sections.push(h('section', { class: 'sec form' },
         field('Predajca', 'vendor', { autocomplete: 'off' }),
         field('Adresa predajcu', 'address', { autocomplete: 'off' }),
-        field('Dátum', 'date', { type: 'date' }),
-        field('Suma celkom', 'total', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr),
-        h('div', { class: 'grid2' },
-          field('z toho DPH', 'vat', { inputmode: 'decimal', autocomplete: 'off' }, parseNum, numToStr),
-          r.source === 'sk-qr'
-            ? h('div', { class: 'field' }, h('label', null, 'Mena'), h('div', { class: 'fixedcur' }, 'EUR'))
-            : (() => {
-                const c = h('select', { id: 'f-currency', disabled: locked }, ['EUR', 'CZK', 'PLN', 'HUF', 'USD', 'GBP', 'CHF'].map((x) => h('option', { value: x }, x)));
-                c.value = r.currency; c.addEventListener('change', () => { r.currency = c.value; autosave(); drawHead(); });
-                return h('div', { class: 'field' }, h('label', { for: 'f-currency' }, 'Mena'), c);
-              })())));
+        field('Dátum', 'date', { type: 'date' })));
     } else {
       sections.push(h('section', { class: 'sec' }, h('h3', null, 'Obchodník'),
         h('strong', null, r.vendor), r.address && h('div', { class: 'meta' }, r.address),
@@ -725,7 +752,7 @@ async function viewForm(id) {
         !locked && h('div', { class: 'foot' }, h('button', { class: 'linkbtn', onclick: () => { editing = true; drawBody(); } }, 'Upraviť údaje'))));
     }
 
-    sections.push(pillsSec());
+    sections.push(amountsSec());
 
     if (r.items?.length) {
       const list = showAllItems ? r.items : r.items.slice(0, 5);
@@ -752,17 +779,7 @@ async function viewForm(id) {
     } }, 'Kopírovať technické dáta (JSON)')));
     if (other.children.length > 1) sections.push(other);
 
-    /* Rozpis DPH */
-    if (r.vatBreakdown?.length) {
-      const sb = r.vatBreakdown.reduce((s, b) => s + b.base, 0), sv = r.vatBreakdown.reduce((s, b) => s + b.vat, 0);
-      sections.push(h('section', { class: 'sec' }, h('h3', null, 'Rozpis DPH'),
-        h('table', { class: 'vat num' },
-          h('thead', null, h('tr', null, h('th', null, 'Sadzba'), h('th', null, 'Bez DPH'), h('th', null, 'DPH'))),
-          h('tbody', null, r.vatBreakdown.map((b) => h('tr', null, h('td', null, `${b.rate} %`), h('td', null, money(b.base, r.currency)), h('td', null, money(b.vat, r.currency))))),
-          r.vatBreakdown.length > 1 && h('tfoot', null, h('tr', null, h('td', null, 'Spolu'), h('td', null, money(sb, r.currency)), h('td', null, money(sv, r.currency)))))));
-    }
-
-    if (!locked) sections.push(h('section', { class: 'sec' }, h('button', { class: 'btn danger', onclick: remove }, 'Zmazať bloček')));
+    sections.push(pillsSec());      // záruka, poznámka a fotka úplne dole
     body.append(...sections.filter(Boolean));
   }
 
@@ -773,6 +790,7 @@ async function viewForm(id) {
     if (!(r.total > 0)) e.total = 'Doplň sumu väčšiu ako 0.';
     if (!r.photo && !r.receiptId) e.photo = 'Pridaj fotku bločku.';
     for (const k of Object.keys(errs)) errs[k].textContent = e[k] || '';
+    if (e.photo) errs.photo?.scrollIntoView({ block: 'center', behavior: 'smooth' });
     if (Object.keys(e).length) { toast(Object.values(e)[0]); if (!editing && (e.vendor || e.date || e.total)) { editing = true; drawBody(); } }
     return Object.keys(e).length === 0;
   }
@@ -790,7 +808,9 @@ async function viewForm(id) {
     h('header', { class: 'hero' }, h('div', { class: 'wrap' },
       h('div', { class: 'hero-top' },
         h('button', { class: 'ghost', onclick: () => history.back() }, '‹ Späť'),
-        h('span', { class: `chip ${r.status} onhero` }, STATUS[r.status])))),
+        h('div', { class: 'hero-actions' },
+          h('span', { class: `chip ${r.status} onhero` }, STATUS[r.status]),
+          !locked && h('button', { class: 'ghost danger', onclick: remove }, 'Zmazať'))))),
     h('main', { class: 'wrap content' },
       locked && h('div', { class: 'banner ok' }, `Odoslaný ${fmtDateTime(r.sentAt)}. Údaje sú zamknuté.`),
       head, body),
