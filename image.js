@@ -66,7 +66,7 @@ export function autoDetect(bmp) {
 }
 
 // Vyreže, zmenší a (voliteľne) zvýrazní text. Výsledok je malé JPEG.
-export function renderCrop(bmp, crop, { enhance = true, maxSide = 1400, quality = 0.72 } = {}) {
+export function renderCrop(bmp, crop, { enhance = true, maxSide = 2400, quality = 0.75 } = {}) {
   const sc = Math.min(1, maxSide / Math.max(crop.w, crop.h));
   const cw = Math.max(1, Math.round(crop.w * sc)), ch = Math.max(1, Math.round(crop.h * sc));
   const c = document.createElement('canvas'); c.width = cw; c.height = ch;

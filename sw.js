@@ -1,6 +1,6 @@
 // Service worker: aplikácia funguje offline, ale ak si online, vždy sa načíta najnovšia verzia.
 // Pri každej zmene súborov zvýš VERSION.
-const VERSION = 'pokladna-v7';
+const VERSION = 'pokladna-v9';
 const SHELL = [
   './', 'index.html', 'styles.css', 'app.js', 'db.js', 'api.js', 'image.js', 'share.js', 'theme.js',
   'vendor/jsQR.js', 'manifest.webmanifest',

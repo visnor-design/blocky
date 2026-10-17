@@ -44,17 +44,23 @@ export function buildIcs(r) {
   return new File([lines.join('\r\n')], `zaruka-${slug(r.vendor)}.ics`, { type: 'text/calendar' });
 }
 
-export function buildBatch(receipts, settings = {}) {
+export const KINDS = {
+  cash: { title: 'POKLADŇA', desc: 'hotovosť', file: 'pokladna', prefix: 'POK' },
+  card: { title: 'PLATBA KARTOU', desc: 'karta', file: 'karta', prefix: 'KARTA' },
+};
+
+export function buildBatch(receipts, settings = {}, kind = null) {
+  const K = KINDS[kind] || null;
   const files = [];
   const photos = [];
   const jsons = [];
-  const rows = [['subor', 'datum', 'predajca', 'ico', 'dic', 'ic_dph', 'suma', 'dph', 'mena', 'rozpis_dph', 'zaruka_do', 'zdroj', 'ekasa_id', 'poznamka'].join(';')];
+  const rows = [['subor', 'datum', 'predajca', 'ico', 'dic', 'ic_dph', 'suma', 'dph', 'mena', 'rozpis_dph', 'zaruka_do', 'zdroj', 'ekasa_id', 'poznamka', 'sposob_uhrady', 'karta_posledne4'].join(';')];
   const lines = [];
   const totals = {};
   const iso = new Date().toISOString();
 
   receipts.forEach((r, i) => {
-    const base = `${String(i + 1).padStart(2, '0')}_${r.date || 'bez-datumu'}_${slug(r.vendor)}_${String(r.total ?? 0).replace('.', '-')}${r.currency}`;
+    const base = `${K ? K.prefix + '_' : ''}${String(i + 1).padStart(2, '0')}_${r.date || 'bez-datumu'}_${slug(r.vendor)}_${String(r.total ?? 0).replace('.', '-')}${r.currency}`;
     const photoName = r.photo ? base + '.jpg' : null;
     if (r.photo) { const pf = new File([r.photo], photoName, { type: 'image/jpeg' }); files.push(pf); photos.push(pf); }
     const json = {
@@ -73,6 +79,7 @@ export function buildBatch(receipts, settings = {}) {
       vatBreakdown: r.vatBreakdown || [],
       items: r.items || [],
       note: r.note || '',
+      paymentMethod: r.payment || null, cardLast4: r.cardLast4 || '',
       photoFile: photoName,
       ekasaRaw: r.ekasaRaw || null,
     };
@@ -81,22 +88,23 @@ export function buildBatch(receipts, settings = {}) {
     rows.push([photoName || base + '.json', r.date, csvText(r.vendor), csvText(r.ico), csvText(r.dic), csvText(r.icDph),
       csvNum(r.total), csvNum(r.vat), r.currency,
       csvText((r.vatBreakdown || []).map((b) => `${b.rate}%: základ ${csvNum(b.base)} DPH ${csvNum(b.vat)}`).join(' | ')),
-      warrantyIso(r), r.source, csvText(r.receiptId), csvText(r.note)].join(';'));
+      warrantyIso(r), r.source, csvText(r.receiptId), csvText(r.note), r.payment || '', csvText(r.cardLast4)].join(';'));
     lines.push(`${i + 1}) ${r.vendor || 'Bez názvu'} | ${skDate(r.date)} | ${money(r.total ?? 0, r.currency)}${r.vat ? ` (DPH ${money(r.vat, r.currency)})` : ''}`);
     totals[r.currency] = (totals[r.currency] || 0) + (r.total || 0);
   });
 
-  const csv = new File(['\uFEFF' + rows.join('\r\n')], 'suhrn.csv', { type: 'text/csv' });
+  const csv = new File(['\uFEFF' + rows.join('\r\n')], K ? `suhrn_${K.file}.csv` : 'suhrn.csv', { type: 'text/csv' });
   files.push(csv);
   // Android Chrome nepovolí .json a naraz najviac 10 súborov: záložné zostavy.
-  const combined = new File([JSON.stringify(jsons, null, 2)], 'blocky-data.txt', { type: 'text/plain' });
+  const combined = new File([JSON.stringify(jsons, null, 2)], K ? `blocky-data_${K.file}.txt` : 'blocky-data.txt', { type: 'text/plain' });
   const altFiles = [...photos, csv, combined];   // údaje v jednom textovom súbore
   const minFiles = [...photos, csv];             // len fotky a súhrn
 
   const sum = Object.entries(totals).map(([c, v]) => money(v, c)).join(' + ');
   const when = skDate(new Date().toLocaleDateString('sv-SE'));
-  const subject = `Bločky ${settings.name ? settings.name + ' – ' : ''}${when} (${receipts.length})`;
+  const subject = `Bločky ${K ? K.title + ' – ' : ''}${settings.name ? settings.name + ' – ' : ''}${when} (${receipts.length})`;
   const text = [
+    ...(K ? [`Typ: ${K.title}`] : []),
     `Bločky od: ${settings.name || '(meno nevyplnené)'}`,
     `Počet: ${receipts.length}`,
     `Spolu: ${sum}`,
@@ -126,16 +134,16 @@ const noShareApi = () => !(navigator.share && navigator.canShare);
 
 // Nájde najväčší počet bločkov, ktorý telefón dovolí poslať naraz (Android: max 10 súborov, bez .json).
 // Uprednostní zostavu s údajmi (json alebo blocky-data.txt) pred väčším počtom bločkov bez údajov.
-export function fitBatch(receipts, settings) {
-  if (noShareApi()) { const batch = buildBatch(receipts, settings); return { batch, count: receipts.length, count_files: batch.files.length }; }
+export function fitBatch(receipts, settings, kind = null) {
+  if (noShareApi()) { const batch = buildBatch(receipts, settings, kind); return { batch, count: receipts.length, count_files: batch.files.length }; }
   for (const n of [3, 4]) {
     for (let k = receipts.length; k >= 1; k--) {
-      const batch = buildBatch(receipts.slice(0, k), settings);
+      const batch = buildBatch(receipts.slice(0, k), settings, kind);
       const v = firstOk(batch, n);
       if (v) return { batch, count: k, count_files: v.list.length };
     }
   }
-  const batch = buildBatch(receipts.slice(0, 1), settings);
+  const batch = buildBatch(receipts.slice(0, 1), settings, kind);
   return { batch, count: 1, count_files: batch.files.length };
 }
 

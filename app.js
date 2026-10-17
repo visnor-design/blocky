@@ -1,9 +1,9 @@
 import * as db from './db.js';
 import * as api from './api.js';
 import { loadBitmap, autoDetect, renderCrop, mountCropper } from './image.js';
-import { buildBatch, fitBatch, shareBatch, warrantyDate, isoDate, buildIcs } from './share.js';
+import { buildBatch, fitBatch, shareBatch, warrantyDate, isoDate, buildIcs, KINDS } from './share.js';
 
-const APP_VERSION = '7';
+const APP_VERSION = '9';
 
 /* ---------- pomocné funkcie ---------- */
 function h(tag, props, ...kids) {
@@ -51,6 +51,7 @@ const sumBy = (rs) => {
   return Object.entries(t).map(([c, v]) => money(v, c)).join(' + ');
 };
 
+const PAY = { cash: 'Pokladňa', card: 'Karta' };
 const SOURCE = { 'sk-qr': 'eKasa QR', photo: 'Fotka', manual: 'Ručne' };
 const STATUS = { draft: 'Rozpracovaný', ready: 'Pripravený', sent: 'Odoslaný' };
 
@@ -72,6 +73,7 @@ function newReceipt(source, extra = {}) {
     receiptId: null, cashRegisterCode: '', receiptNumber: null, okp: '',
     items: [], vatBreakdown: [], vatCheck: true, ekasaRaw: null, photo: null,
     warrantyYears: null,
+    payment: getSettings().lastPayment || null, cardLast4: '',
     batchId: null, sentAt: null, sentBy: null, ...extra,
   };
 }
@@ -125,6 +127,7 @@ let cleanup = null;
 let pending = null;            // fotka čakajúca na orezanie { bmp, target }
 let listTab = 'todo';
 let filtersOpen = false;
+let payFilter = 'all';        // all | cash | card
 const F = { q: '', from: '', to: '', min: '', max: '' };
 const selected = new Set();
 
@@ -139,6 +142,8 @@ function render(st) {
   window.scrollTo(0, 0);
   const { view, params } = st || { view: 'list', params: {} };
   if (view === 'scan') return viewScan();
+  if (view === 'send') return viewSend(params);
+  if (view === 'diag') return viewDiag();
   if (view === 'crop') return viewCrop();
   if (view === 'form') return viewForm(params.id);
   return viewList();
@@ -161,8 +166,9 @@ function installBanner(rerender) {
 }
 
 /* ---------- zoznam ---------- */
-const filtersActive = () => Object.values(F).some(Boolean);
+const filtersActive = () => payFilter !== 'all' || Object.values(F).some(Boolean);
 function passes(r) {
+  if (payFilter !== 'all' && r.payment !== payFilter) return false;
   if (F.q) {
     const hay = norm(`${r.vendor} ${r.ico} ${r.note} ${r.address}`);
     if (!hay.includes(norm(F.q))) return false;
@@ -183,7 +189,7 @@ async function viewList() {
   const activeW = withW.filter((r) => remaining(warrantyDate(r)).days >= 0);
   const ready = todo.filter((r) => r.status === 'ready');
   const drafts = todo.filter((r) => r.status === 'draft');
-  for (const id of [...selected]) if (!ready.some((r) => r.id === id)) selected.delete(id);
+  for (const id of [...selected]) if (!ready.some((r) => r.id === id && r.payment)) selected.delete(id);
   const full = () => render({ view: 'list' });
 
   const tab = (key, label, count) => h('button', {
@@ -191,17 +197,25 @@ async function viewList() {
     onclick: () => { listTab = key; full(); },
   }, label, h('span', { class: 'count num' }, String(count)));
 
+  const cnt = (n, a1, a2, a5) => (n === 1 ? a1 : n >= 2 && n <= 4 ? a2 : a5);
+  const readySplit = [...['cash', 'card'].map((k) => { const rr = ready.filter((r) => r.payment === k); return rr.length ? `${PAY[k]} ${sumBy(rr)}` : null; }),
+    (() => { const rr = ready.filter((r) => !r.payment); return rr.length ? `bez úhrady ${rr.length}` : null; })()].filter(Boolean).join(' · ');
   const big = listTab === 'todo'
-    ? [String(ready.length), ready.length === 1 ? 'pripravený na odoslanie' : 'pripravených na odoslanie', `${drafts.length} rozpracovaných${ready.length ? ' · ' + sumBy(ready) : ''}`]
+    ? { n: ready.length, label: cnt(ready.length, 'pripravený na odoslanie', 'pripravené na odoslanie', 'pripravených na odoslanie'), amt: sumBy(ready) || '0,00 €', sub: readySplit,
+        draft: `${drafts.length} ${cnt(drafts.length, 'rozpracovaný', 'rozpracované', 'rozpracovaných')}${drafts.length && sumBy(drafts) ? ' · ' + sumBy(drafts) : ''}` }
     : listTab === 'sent'
-      ? [String(sent.length), sent.length === 1 ? 'odoslaný bloček' : 'odoslaných bločkov', sumBy(sent)]
-      : [String(activeW.length), 'platných záruk', `${withW.length - activeW.length} vypršaných`];
+      ? { n: sent.length, label: cnt(sent.length, 'odoslaný bloček', 'odoslané bločky', 'odoslaných bločkov'), amt: sumBy(sent), sub: '', draft: '' }
+      : { n: activeW.length, label: cnt(activeW.length, 'platná záruka', 'platné záruky', 'platných záruk'), amt: '', sub: `${withW.length - activeW.length} vypršaných`, draft: '' };
 
   const hero = h('header', { class: 'hero' }, h('div', { class: 'wrap' },
     h('div', { class: 'hero-top' },
       h('div', { class: 'brand' }, h('img', { class: 'logo', src: 'icons/logo.png', alt: 'Pastorkalt', width: '40', height: '36' }), h('h1', null, 'Bločky')),
       h('button', { class: 'ghost', onclick: openSettings }, 'Nastavenia')),
-    h('div', { class: 'big' }, h('span', { class: 'big-n num' }, big[0]), h('span', { class: 'big-l' }, big[1]), h('span', { class: 'big-s num' }, big[2])),
+    h('div', { class: 'big' },
+      h('span', { class: 'big-n num' }, String(big.n)),
+      h('div', { class: 'big-main' }, h('span', { class: 'big-l' }, big.label), big.amt && h('strong', { class: 'big-amt num' }, big.amt)),
+      big.sub && h('span', { class: 'big-s num' }, big.sub)),
+    big.draft && h('div', { class: 'draftline num' }, big.draft),
     h('div', { class: 'tabs', role: 'tablist' }, tab('todo', 'Aktuálne', todo.length), tab('sent', 'Odoslané', sent.length), tab('warranty', 'Záruky', withW.length))));
 
   /* filter */
@@ -217,15 +231,22 @@ async function viewList() {
     i.addEventListener('input', () => { F[key] = i.value; drawList(); });
     return h('div', { class: 'field' }, h('label', { for: 'flt-' + key }, label), i);
   };
+  const chipSrc = listTab === 'todo' ? todo : listTab === 'sent' ? sent : withW;
+  const chip = (key, label) => {
+    const n = key === 'all' ? chipSrc.length : chipSrc.filter((r) => r.payment === key).length;
+    return h('button', { class: 'pchip' + (payFilter === key ? ' on' : ''), 'aria-pressed': String(payFilter === key), onclick: () => { payFilter = key; full(); } },
+      label, h('span', { class: 'num' }, String(n)));
+  };
+  const chips = h('div', { class: 'paychips', role: 'group', 'aria-label': 'Filter podľa úhrady' }, chip('all', 'Všetko'), chip('cash', 'Pokladňa'), chip('card', 'Karta'));
   const panel = filtersOpen ? h('div', { class: 'filterpanel' },
     h('div', { class: 'grid2' }, fin('Dátum od', 'from', { type: 'date' }), fin('Dátum do', 'to', { type: 'date' })),
     h('div', { class: 'grid2' }, fin('Suma od', 'min', { inputmode: 'decimal' }), fin('Suma do', 'max', { inputmode: 'decimal' })),
-    h('button', { class: 'btn small', onclick: () => { Object.keys(F).forEach((k) => (F[k] = '')); full(); } }, 'Vymazať filter')) : null;
+    h('button', { class: 'btn small', onclick: () => { Object.keys(F).forEach((k) => (F[k] = '')); payFilter = 'all'; full(); } }, 'Vymazať filter')) : null;
 
   function drawDock() {
     dockBox.replaceChildren(h('div', { class: 'dock' }, h('div', { class: 'wrap dock-in' },
       h('button', { class: 'btn' + (selected.size ? '' : ' primary grow'), onclick: () => go('scan') }, '+ Skenovať'),
-      selected.size > 0 && listTab === 'todo' && h('button', { class: 'btn primary grow', onclick: () => openSendSheet([...selected]) }, `Odoslať (${selected.size})`))));
+      selected.size > 0 && listTab === 'todo' && h('button', { class: 'btn primary grow', onclick: () => go('send', { ids: [...selected] }) }, `Odoslať (${selected.size})`))));
   }
 
   function drawList() {
@@ -241,7 +262,7 @@ async function viewList() {
         h('strong', null, none ? (listTab === 'todo' ? 'Zatiaľ tu nie sú žiadne bločky' : listTab === 'sent' ? 'Zatiaľ nič nebolo odoslané' : 'Zatiaľ nemáš žiadne záruky') : 'Filtru nezodpovedá žiadny bloček'),
         h('p', null, none ? (listTab === 'todo' ? 'Naskenuj QR kód zo slovenského bločku alebo odfoť zahraničný doklad.' : listTab === 'sent' ? 'Po odoslaní emailom sa tu zobrazí história po dávkach.' : 'Záruku pridáš v detaile bločku.') : 'Zmeň alebo vymaž filter.'))));
     } else if (listTab === 'todo') {
-      const rdy = shown.filter((r) => r.status === 'ready');
+      const rdy = shown.filter((r) => r.status === 'ready' && r.payment);
       if (rdy.length > 1) {
         const all = rdy.every((r) => selected.has(r.id));
         listBox.append(h('div', { class: 'selbar' },
@@ -254,15 +275,9 @@ async function viewList() {
       for (const r of shown) { const k = r.batchId || 'bez-davky'; (batches.get(k) || batches.set(k, []).get(k)).push(r); }
       [...batches.values()].sort((a, b) => b[0].sentAt - a[0].sentAt).forEach((rs) => {
         listBox.append(h('section', { class: 'batch' },
-          h('h2', null, fmtDateTime(rs[0].sentAt)),
+          h('h2', null, `${fmtDateTime(rs[0].sentAt)}${rs[0].payment ? ' · ' + PAY[rs[0].payment] : ''}`),
           h('p', { class: 'meta num' }, `${rs.length} ${plural(rs.length)} · ${sumBy(rs)}${rs[0].sentBy ? ' · ' + rs[0].sentBy : ''}`),
-          h('div', { class: 'paper' }, rs.map((r) => rowEl(r, {}))),
-          h('div', { class: 'foot' },
-            h('button', { class: 'btn small', onclick: () => openSendSheet(rs.map((r) => r.id), true) }, 'Odoslať znova'),
-            h('button', { class: 'btn small', onclick: async () => {
-              for (const r of rs) { r.status = 'ready'; r.batchId = null; r.sentAt = null; r.sentBy = null; await db.put(r); selected.add(r.id); }
-              listTab = 'todo'; full();
-            } }, 'Vrátiť medzi pripravené'))));
+          h('div', { class: 'paper' }, rs.map((r) => rowEl(r, {})))));
       });
     } else {
       const sorted = [...shown].sort((a, b) => {
@@ -276,14 +291,14 @@ async function viewList() {
 
   $app.append(hero,
     h('main', { class: 'wrap content' }, installBanner(full),
-      h('div', { class: 'filterbar' }, search, filterBtn), panel, infoBox, listBox),
+      h('div', { class: 'filterbar' }, search, filterBtn), chips, panel, infoBox, listBox),
     dockBox);
   drawList();
 }
 
 function rowEl(r, { selectable = false, redraw = null, warranty = false } = {}) {
   let pick = null;
-  if (selectable && r.status === 'ready') {
+  if (selectable && r.status === 'ready' && r.payment) {
     const i = h('input', { type: 'checkbox' });
     i.checked = selected.has(r.id);
     i.addEventListener('change', () => { i.checked ? selected.add(r.id) : selected.delete(r.id); redraw(); });
@@ -300,7 +315,9 @@ function rowEl(r, { selectable = false, redraw = null, warranty = false } = {}) 
     h('button', { class: 'main', onclick: () => go('form', { id: r.id }) },
       h('span', { class: 'vendor' }, r.vendor || 'Bez názvu'),
       h('span', { class: 'amount num' }, money(r.total, r.currency)),
-      h('span', { class: 'meta' }, meta), chip));
+      h('span', { class: 'meta' }, meta,
+        !warranty && r.payment && [' · ', h('span', { class: `pay ${r.payment}` }, PAY[r.payment])],
+        !warranty && !r.payment && r.status !== 'sent' && [' · ', h('span', { class: 'pay none' }, 'bez úhrady')]), chip));
 }
 
 /* ---------- nastavenia ---------- */
@@ -352,6 +369,7 @@ function openSettings() {
       h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť')),
     h('div', { class: 'verline' },
       h('span', { class: 'meta' }, `Verzia ${APP_VERSION}`),
+      h('button', { class: 'linkbtn', onclick: () => { d.close(); go('diag'); } }, 'Diagnostika odosielania'),
       h('button', { class: 'linkbtn', onclick: async () => {
         try { const reg = await navigator.serviceWorker?.getRegistration(); await reg?.update(); } catch { /* offline */ }
         location.reload();
@@ -360,51 +378,94 @@ function openSettings() {
 }
 
 /* ---------- odoslanie emailom ---------- */
-async function openSendSheet(ids, resend = false) {
+async function viewSend({ ids = [], resend = false } = {}) {
   const all = await db.all();
-  let rs = all.filter((r) => ids.includes(r.id) && (resend ? r.status === 'sent' : r.status === 'ready'));
-  if (!rs.length) return toast('Nie je čo odoslať.');
+  const picked = all.filter((r) => ids.includes(r.id) && (resend ? r.status === 'sent' : r.status === 'ready'));
+  if (!picked.length) { toast('Nie je čo odoslať.'); return history.back(); }
   const st = getSettings();
   const mailto = st.sendMode === 'mailto';
-  let batch, trimmed = 0, nFiles = 0;
-  if (mailto) { batch = buildBatch(rs, st); nFiles = batch.altFiles.length; }
-  else {
-    // Android dovolí naraz najviac 10 príloh. Poslať sa dá toľko bločkov, koľko telefón povolí.
-    const fit = fitBatch(rs, st);
-    batch = fit.batch; nFiles = fit.count_files; trimmed = rs.length - fit.count; rs = rs.slice(0, fit.count);
+  const noPay = picked.filter((r) => !r.payment);
+
+  // Pokladňa a karta idú v samostatných emailoch (jeden email = jeden cieľ v portáli).
+  const groups = ['cash', 'card'].map((kind) => {
+    const list = picked.filter((r) => r.payment === kind);
+    if (!list.length) return null;
+    let batch, rs = list, trimmed = 0, nFiles;
+    if (mailto) { batch = buildBatch(list, st, kind); nFiles = batch.altFiles.length; }
+    else {
+      const fit = fitBatch(list, st, kind);       // Android: max 10 príloh naraz
+      batch = fit.batch; nFiles = fit.count_files; trimmed = list.length - fit.count; rs = list.slice(0, fit.count);
+    }
+    return { kind, rs, batch, nFiles, trimmed };
+  }).filter(Boolean);
+  if (!groups.length) { toast('Pri vybraných bločkoch chýba spôsob úhrady. Otvor ich a vyber pokladňu alebo kartu.', 5000); return history.back(); }
+
+  async function doSend(g) {
+    let res;
+    try { res = await shareBatch({ ...g.batch, to: st.to, mode: st.sendMode }); }   // hneď po kliknutí
+    catch (e) { return toast(`Odoslanie zlyhalo: ${e.name || ''} ${e.message || ''}`, 8000); }
+    if (res.status === 'cancelled') return;
+    if (res.note) toast(res.note, 6000);
+    const ok = await confirmDialog({
+      title: 'Odoslal si email?',
+      text: res.status === 'fallback'
+        ? `${res.failure ? `Zdieľanie zlyhalo (${res.failure}). ` : ''}Súbory sa stiahli a otvorila sa pošta. Pripoj stiahnuté súbory k emailu a odošli ho. Potom bločky označím ako odoslané.`
+        : `Ak si email (${KINDS[g.kind].title}) odoslal, označím tieto bločky ako odoslané.`,
+      yes: 'Áno, odoslané', no: 'Nie, ešte nie',
+    });
+    if (!ok) return;
+    const batchId = crypto.randomUUID(), sentAt = Date.now();
+    for (const r of g.rs) { r.status = 'sent'; r.batchId = batchId; r.sentAt = sentAt; r.sentBy = st.name || ''; selected.delete(r.id); await db.put(r); }
+    toast('Označené ako odoslané.');
+    const rest = resend ? [] : picked.filter((r) => r.status === 'ready' && r.payment);
+    if (rest.length) {       // ďalší email (druhý druh úhrady alebo zvyšok)
+      const next = { view: 'send', params: { ids: rest.map((r) => r.id), resend: false } };
+      history.replaceState(next, ''); render(next);
+    } else history.back();
   }
 
-  const d = openDialog(h('div', { class: 'dlg-body' },
-    h('h2', null, `Odoslať ${rs.length} ${plural(rs.length)}`),
-    h('p', { class: 'num' }, `${batch.sum} · ${nFiles} príloh · ${kb(batch.totalBytes)}`),
-    trimmed > 0 && h('p', { class: 'banner' }, `Tento telefón dovolí poslať naraz najviac ${rs.length} ${plural(rs.length)}. Odošlú sa prvé, ďalších ${trimmed} ostane pripravených na ďalší email.`),
-    batch.totalBytes > 20 * 1048576 && h('p', { class: 'banner' }, 'Prílohy majú viac ako 20 MB. Niektoré pošty ich neodošlú. Rozdeľ odosielanie na menej bločkov.'),
-    h('div', { class: 'addr' },
-      h('div', null, h('div', { class: 'meta' }, 'Adresát'), h('strong', null, st.to || 'nie je nastavený (Nastavenia)')),
-      st.to && h('button', { class: 'btn small', onclick: async () => { try { await navigator.clipboard.writeText(st.to); toast('Adresa skopírovaná.'); } catch { toast('Adresu sa nepodarilo skopírovať.'); } } }, 'Kopírovať')),
-    h('p', { class: 'note' }, mailto
-      ? 'Súbory sa stiahnu a otvorí sa predvolená pošta s adresátom. Pripoj stiahnuté súbory a email odošli.'
-      : 'Otvorí sa zoznam aplikácií so všetkými prílohami. Vyber poštu, vlož adresu a odošli zo svojho účtu.'),
-    h('div', { class: 'actions' },
-      h('button', { class: 'btn primary', onclick: async () => {
-        const res = await shareBatch({ ...batch, to: st.to, mode: st.sendMode });   // hneď po kliknutí
-        d.close();
-        if (res.status === 'cancelled') return;
-        if (res.note) toast(res.note, 6000);
-        const ok = await confirmDialog({
-          title: 'Odoslal si email?',
-          text: res.status === 'fallback'
-            ? `${res.failure ? `Zdieľanie zlyhalo (${res.failure}). ` : ''}Súbory sa stiahli a otvorila sa pošta. Pripoj stiahnuté súbory k emailu a odošli ho. Potom bločky označím ako odoslané.`
-            : 'Ak si email odoslal, označím tieto bločky ako odoslané.',
-          yes: 'Áno, odoslané', no: 'Nie, ešte nie',
-        });
-        if (!ok) return;
-        const batchId = crypto.randomUUID(), sentAt = Date.now();
-        for (const r of rs) { r.status = 'sent'; r.batchId = batchId; r.sentAt = sentAt; r.sentBy = st.name || ''; selected.delete(r.id); await db.put(r); }
-        toast('Označené ako odoslané.');
-        render({ view: 'list' });
-      } }, mailto ? 'Stiahnuť a otvoriť poštu' : 'Otvoriť poštu'),
-      h('button', { class: 'btn', onclick: () => d.close() }, 'Zrušiť'))));
+  $app.append(
+    h('header', { class: 'hero' }, h('div', { class: 'wrap' },
+      h('div', { class: 'hero-top' }, h('button', { class: 'ghost', onclick: () => history.back() }, '‹ Späť'), h('h1', { class: 'sm' }, 'Odoslať emailom')))),
+    h('main', { class: 'wrap content' },
+      h('div', { class: 'addr' },
+        h('div', null, h('div', { class: 'meta' }, 'Adresát'), h('strong', null, st.to || 'nie je nastavený (Nastavenia)')),
+        st.to && h('button', { class: 'btn small', onclick: async () => { try { await navigator.clipboard.writeText(st.to); toast('Adresa skopírovaná.'); } catch { toast('Adresu sa nepodarilo skopírovať.'); } } }, 'Kopírovať')),
+      noPay.length > 0 && h('p', { class: 'banner' }, `${noPay.length} ${plural(noPay.length)} nemá spôsob úhrady, preto sa neodošle. Otvor ho a vyber pokladňu alebo kartu.`),
+      groups.map((g) => h('section', { class: 'sendgroup' },
+        h('h3', null, `${PAY[g.kind]} · ${g.rs.length} ${plural(g.rs.length)}`),
+        h('p', { class: 'num meta' }, `${g.batch.sum} · ${g.nFiles} príloh · ${kb(g.batch.totalBytes)}`),
+        g.trimmed > 0 && h('p', { class: 'banner' }, `Tento telefón dovolí poslať naraz najviac ${g.rs.length} ${plural(g.rs.length)}. Ďalších ${g.trimmed} ostane na ďalší email.`),
+        g.batch.totalBytes > 20 * 1048576 && h('p', { class: 'banner' }, 'Prílohy majú viac ako 20 MB. Niektoré pošty ich neodošlú. Rozdeľ odosielanie na menej bločkov.'),
+        h('button', { class: 'btn primary', onclick: () => doSend(g) }, `${mailto ? 'Stiahnuť a otvoriť poštu' : 'Odoslať'}: ${PAY[g.kind]} (${g.rs.length})`))),
+      h('p', { class: 'note' }, mailto
+        ? 'Súbory sa stiahnu a otvorí sa predvolená pošta s adresátom. Pripoj stiahnuté súbory a email odošli.'
+        : 'Otvorí sa zoznam aplikácií so všetkými prílohami. Vyber poštu, vlož adresu a odošli zo svojho účtu.')));
+}
+
+/* Diagnostika odosielania: pomôže zistiť, čo telefón povoľuje */
+function viewDiag() {
+  const can = (name, type) => {
+    try { return navigator.canShare?.({ files: [new File(['x'], name, { type })] }) ? 'áno' : 'nie'; } catch (e) { return `chyba (${e.name})`; }
+  };
+  const rows = [
+    ['Zdieľanie (share)', navigator.share ? 'áno' : 'nie'],
+    ['Zdieľanie súborov (canShare)', navigator.canShare ? 'áno' : 'nie'],
+    ['Fotka .jpg', can('a.jpg', 'image/jpeg')], ['Súhrn .csv', can('a.csv', 'text/csv')],
+    ['Text .txt', can('a.txt', 'text/plain')], ['Údaje .json', can('a.json', 'application/json')],
+    ['Appka na ploche', (matchMedia('(display-mode: standalone)').matches || navigator.standalone) ? 'áno' : 'nie'],
+    ['Verzia appky', APP_VERSION], ['Prehliadač', navigator.userAgent.slice(0, 100)],
+  ];
+  $app.append(
+    h('header', { class: 'hero' }, h('div', { class: 'wrap' },
+      h('div', { class: 'hero-top' }, h('button', { class: 'ghost', onclick: () => history.back() }, '‹ Späť'), h('h1', { class: 'sm' }, 'Diagnostika')))),
+    h('main', { class: 'wrap content' },
+      h('dl', { class: 'kv' }, rows.map(([k, v]) => h('div', null, h('dt', null, k), h('dd', null, v)))),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn primary', onclick: async () => {
+          try { await navigator.share({ files: [new File(['Skúška zdieľania z appky Bločky'], 'skuska.txt', { type: 'text/plain' })], title: 'Skúška zdieľania' }); toast('Zdieľanie funguje.'); }
+          catch (e) { toast(e.name === 'AbortError' ? 'Zrušené.' : `Zdieľanie zlyhalo: ${e.name} ${e.message || ''}`, 8000); }
+        } }, 'Vyskúšať zdieľanie'))));
 }
 
 /* ---------- skener ---------- */
@@ -418,8 +479,13 @@ function viewScan() {
   const frame = h('div', { class: 'frame' });
   const barBox = h('div', { class: 'bar' });
   const overlay = h('div', { class: 'scan' });
-  const stop = () => { active = false; cancelAnimationFrame(raf); if (stream) stream.getTracks().forEach((t) => t.stop()); };
+  const stopStream = () => { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; };
+  const onVis = () => {          // po návrate z fotoaparátu telefónu sa kamera v appke znova spustí
+    if (document.visibilityState === 'visible' && active && (!stream || stream.getVideoTracks()[0]?.readyState !== 'live')) startCamera();
+  };
+  const stop = () => { active = false; cancelAnimationFrame(raf); document.removeEventListener('visibilitychange', onVis); stopStream(); };
   cleanup = stop;
+  document.addEventListener('visibilitychange', onVis);
 
   const toCrop = async (bmp) => {
     pending = { bmp, target: rcpt ? rcpt.id : null, next: rcpt ? 'form' : null };
@@ -436,27 +502,36 @@ function viewScan() {
   const manual = async () => { const r = newReceipt('manual'); await db.put(r); stop(); go('form', { id: r.id }, { replace: true }); };
   const openForm = (r) => { stop(); go('form', { id: r.id }, { replace: true }); };
 
-  // Zábery z živej kamery (bez otvárania systémovej aplikácie fotoaparátu).
+  // Fotka z živej kamery. Na Androide v plnom rozlíšení fotoaparátu, inak snímka z videa.
   async function capture() {
-    if (!video.videoWidth) return toast('Kamera ešte nie je pripravená.');
-    const c = document.createElement('canvas');
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext('2d').drawImage(video, 0, 0);
+    const track = stream?.getVideoTracks()[0];
+    if (!track || !video.videoWidth) return toast('Kamera ešte nie je pripravená.');
     if (navigator.vibrate) navigator.vibrate(40);
-    try { await toCrop(await createImageBitmap(c)); } catch { toast('Fotku sa nepodarilo vytvoriť.'); }
+    try {
+      if (window.ImageCapture) {
+        try { return await toCrop(await loadBitmap(await new ImageCapture(track).takePhoto())); } catch { /* skúsime snímku z videa */ }
+      }
+      const c = document.createElement('canvas');
+      c.width = video.videoWidth; c.height = video.videoHeight;
+      c.getContext('2d').drawImage(video, 0, 0);
+      await toCrop(await createImageBitmap(c));
+    } catch { toast('Fotku sa nepodarilo vytvoriť.'); }
   }
 
+  const PHOTO_HINT = 'Odfoť bloček zblízka, na celú výšku.';
   function setMode(mode, msg) {
     const photo = mode === 'photo';
     busy = photo;
     frame.className = 'frame' + (photo ? ' tall' : '');
     hint.className = 'hint' + (photo ? ' top' : '');
-    hint.textContent = msg || 'Namier kameru na QR kód na bločku';
+    hint.textContent = msg || (photo ? PHOTO_HINT : 'Namier kameru na QR kód na bločku');
     barBox.replaceChildren(...(photo
-      ? [h('button', { class: 'btn signal', onclick: capture }, rcpt ? 'Odfotiť bloček' : 'Odfotiť'),
-         rcpt ? h('button', { class: 'btn', onclick: () => openForm(rcpt) }, 'Preskočiť fotku')
-              : h('button', { class: 'btn', onclick: () => setMode('qr') }, 'Späť na QR kód')]
-      : [h('button', { class: 'btn signal', onclick: () => setMode('photo', 'Odfoť celý bloček tak, aby bol celý v zábere') }, 'Odfotiť zahraničný bloček'),
+      ? [h('button', { class: 'btn signal', onclick: capture }, 'Odfotiť bloček'),
+         h('div', { class: 'barrow' },
+           h('button', { class: 'btn small', onclick: () => fileInput.click() }, 'Fotoaparát'),
+           rcpt ? h('button', { class: 'btn small', onclick: () => openForm(rcpt) }, 'Preskočiť')
+                : h('button', { class: 'btn small', onclick: () => setMode('qr') }, 'Späť na QR'))]
+      : [h('button', { class: 'btn signal', onclick: () => setMode('photo') }, 'Odfotiť zahraničný bloček'),
          h('button', { class: 'btn', onclick: manual }, 'Zadať ručne')]));
   }
 
@@ -466,7 +541,7 @@ function viewScan() {
     const rid = api.parseEkasaQr(text);
     if (!rid) {
       hint.textContent = 'Toto nie je QR kód slovenského bločku. Skús iný alebo odfoť bloček.';
-      setTimeout(() => { if (mode0()) busy = false; hint.textContent = 'Namier kameru na QR kód na bločku'; }, 2200);
+      setTimeout(() => { if (!rcpt && !hint.classList.contains('top')) busy = false; hint.textContent = 'Namier kameru na QR kód na bločku'; }, 2200);
       return;
     }
     const dup = await db.findByReceiptId(rid);
@@ -481,11 +556,9 @@ function viewScan() {
     await db.put(r);
     rcpt = r;
     if (getSettings().autoPhoto !== false && active) {
-      // Kamera už beží, rovno ponúkneme odfotenie bločku.
-      setMode('photo', res.ok ? 'Údaje načítané. Teraz odfoť celý bloček.' : 'QR kód uložený. Teraz odfoť celý bloček.');
+      setMode('photo', `${res.ok ? 'Údaje načítané.' : 'QR kód uložený.'} ${PHOTO_HINT}`);
     } else openForm(r);
   }
-  const mode0 = () => !rcpt && !hint.classList.contains('top');   // sme v režime QR
 
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -504,27 +577,34 @@ function viewScan() {
   }
 
   const close = h('button', { class: 'btn small close', onclick: () => history.back() }, 'Zavrieť');
-  overlay.append(video, frame, hint, close, barBox, fileInput);
+  overlay.append(video, h('div', { class: 'scanbody' }, frame, hint), close, barBox, fileInput);
   $app.append(overlay);
   setMode('qr');
 
   const cameraError = (text) => {
     hint.textContent = '';
+    overlay.querySelector('.msg')?.remove();
     overlay.append(h('div', { class: 'msg' }, h('strong', null, 'Kamera nie je dostupná'), h('span', null, text),
       h('button', { class: 'btn signal', onclick: () => fileInput.click() }, 'Odfotiť bloček'),
       h('button', { class: 'btn', onclick: manual }, 'Zadať ručne'),
       h('button', { class: 'btn', onclick: () => history.back() }, 'Späť')));
   };
-  if (!navigator.mediaDevices?.getUserMedia) return cameraError('Tento prehliadač nepodporuje prístup ku kamere.');
-  navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
-    .then((s) => {
+  async function startCamera() {
+    if (!navigator.mediaDevices?.getUserMedia) return cameraError('Tento prehliadač nepodporuje prístup ku kamere.');
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } }, audio: false });
       if (!active) { s.getTracks().forEach((t) => t.stop()); return; }
-      stream = s; video.srcObject = s;
-      return video.play().then(() => { raf = requestAnimationFrame(tick); });
-    })
-    .catch((e) => cameraError(e.name === 'NotAllowedError'
-      ? 'Aplikácia nemá povolenú kameru. Povoľ ju v nastaveniach prehliadača a skús znova.'
-      : 'Kameru sa nepodarilo spustiť.'));
+      stopStream(); stream = s; video.srcObject = s;
+      await video.play();
+      overlay.querySelector('.msg')?.remove();
+      cancelAnimationFrame(raf); raf = requestAnimationFrame(tick);
+    } catch (e) {
+      cameraError(e.name === 'NotAllowedError'
+        ? 'Aplikácia nemá povolenú kameru. Povoľ ju v nastaveniach prehliadača a skús znova.'
+        : 'Kameru sa nepodarilo spustiť.');
+    }
+  }
+  startCamera();
 }
 
 /* ---------- orezanie fotky ---------- */
@@ -697,6 +777,27 @@ async function viewForm(id) {
       errEl('photo'));
   }
 
+  /* Spôsob úhrady: pokladňa (hotovosť) alebo platba kartou */
+  function paySec() {
+    const sec = h('section', { class: 'sec' }, h('h3', null, 'Spôsob úhrady'));
+    const mk = (k, title, sub) => h('button', {
+      class: r.payment === k ? 'on' : '', role: 'radio', 'aria-checked': String(r.payment === k), disabled: locked,
+      onclick: async () => {
+        r.payment = k; if (k !== 'card') r.cardLast4 = '';
+        setSettings({ ...getSettings(), lastPayment: k });   // nabudúce sa predvolí posledná voľba
+        await persist(); drawBody();
+      },
+    }, h('span', null, title), h('small', null, sub));
+    sec.append(h('div', { class: 'paysel', role: 'radiogroup', 'aria-label': 'Spôsob úhrady' }, mk('cash', 'Pokladňa', 'hotovosť'), mk('card', 'Karta', 'platba kartou')));
+    if (r.payment === 'card') {
+      const i = h('input', { id: 'f-last4', inputmode: 'numeric', placeholder: 'napr. 1234', autocomplete: 'off', disabled: locked }); i.value = r.cardLast4 || '';
+      i.addEventListener('input', () => { r.cardLast4 = i.value.replace(/\D/g, '').slice(0, 4); if (i.value !== r.cardLast4) i.value = r.cardLast4; autosave(); });
+      sec.append(h('div', { class: 'field gap' }, h('label', { for: 'f-last4' }, 'Posledné 4 číslice karty (nepovinné)'), i));
+    }
+    sec.append(errEl('payment'));
+    return sec;
+  }
+
   /* Sumy a DPH: celková zaplatená suma + rozpis podľa sadzieb */
   function amountsSec() {
     const sec = h('section', { class: 'sec' }, h('h3', null, 'Sumy a DPH'));
@@ -737,6 +838,8 @@ async function viewForm(id) {
             !locked && h('button', { class: 'btn small', onclick: (e) => retry(e.currentTarget) }, 'Skúsiť znova')));
     }
     if (official && r.vatCheck === false) sections.push(h('div', { class: 'banner' }, 'Súčet položiek nesedí s celkovou sumou. Skontroluj rozpis DPH.'));
+
+    sections.push(paySec());
 
     /* Obchodník + dátum */
     if (editing) {
@@ -780,6 +883,11 @@ async function viewForm(id) {
     if (other.children.length > 1) sections.push(other);
 
     sections.push(pillsSec());      // záruka, poznámka a fotka úplne dole
+    if (locked) sections.push(h('section', { class: 'sec' }, h('h3', null, 'Odoslaný bloček'),
+      h('p', { class: 'meta' }, `Odoslaný ${fmtDateTime(r.sentAt)}${r.sentBy ? ' · ' + r.sentBy : ''}.`),
+      h('div', { class: 'foot nomargin' },
+        h('button', { class: 'btn small', onclick: () => go('send', { ids: [r.id], resend: true }) }, 'Odoslať znova'),
+        h('button', { class: 'btn small', onclick: reopen }, 'Vrátiť medzi pripravené'))));
     body.append(...sections.filter(Boolean));
   }
 
@@ -789,14 +897,19 @@ async function viewForm(id) {
     if (!r.date) e.date = 'Doplň dátum.';
     if (!(r.total > 0)) e.total = 'Doplň sumu väčšiu ako 0.';
     if (!r.photo && !r.receiptId) e.photo = 'Pridaj fotku bločku.';
+    if (!r.payment) e.payment = 'Vyber spôsob úhrady: pokladňa alebo karta.';
     for (const k of Object.keys(errs)) errs[k].textContent = e[k] || '';
-    if (e.photo) errs.photo?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (e.payment) errs.payment?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    else if (e.photo) errs.photo?.scrollIntoView({ block: 'center', behavior: 'smooth' });
     if (Object.keys(e).length) { toast(Object.values(e)[0]); if (!editing && (e.vendor || e.date || e.total)) { editing = true; drawBody(); } }
     return Object.keys(e).length === 0;
   }
   const setReady = async () => { if (!validate()) return; r.status = 'ready'; await persist(); selected.add(r.id); toast('Bloček je pripravený na odoslanie.'); history.back(); };
   const setDraft = async () => { r.status = 'draft'; selected.delete(r.id); await persist(); history.back(); };
-  const reopen = async () => { r.status = 'ready'; r.batchId = null; r.sentAt = null; r.sentBy = null; await persist(); selected.add(r.id); go('list', {}, { replace: true }); };
+  const reopen = async () => {
+    if (!(await confirmDialog({ title: 'Vrátiť medzi pripravené?', text: 'Bloček sa odomkne a môže sa odoslať znova.', yes: 'Vrátiť', no: 'Ponechať odoslaný' }))) return;
+    r.status = 'ready'; r.batchId = null; r.sentAt = null; r.sentBy = null; await persist(); selected.add(r.id); listTab = 'todo'; go('list', {}, { replace: true });
+  };
   const remove = async () => {
     if (!(await confirmDialog({ title: 'Zmazať bloček?', text: 'Tento krok sa nedá vrátiť späť.', yes: 'Zmazať', no: 'Ponechať' }))) return;
     clearTimeout(saveTimer); cleanup = () => { if (photoUrl) URL.revokeObjectURL(photoUrl); };
@@ -814,16 +927,17 @@ async function viewForm(id) {
     h('main', { class: 'wrap content' },
       locked && h('div', { class: 'banner ok' }, `Odoslaný ${fmtDateTime(r.sentAt)}. Údaje sú zamknuté.`),
       head, body),
-    h('div', { class: 'dock' }, h('div', { class: 'wrap dock-in' },
-      locked
-        ? h('button', { class: 'btn primary grow', onclick: reopen }, 'Znovu otvoriť')
-        : r.status === 'ready'
-          ? h('button', { class: 'btn grow', onclick: setDraft }, 'Vrátiť medzi rozpracované')
-          : h('button', { class: 'btn primary grow', onclick: setReady }, 'Pripravený na odoslanie'))),
+    !locked && h('div', { class: 'dock' }, h('div', { class: 'wrap dock-in' },
+      r.status === 'ready'
+        ? h('button', { class: 'btn grow', onclick: setDraft }, 'Vrátiť medzi rozpracované')
+        : h('button', { class: 'btn primary grow', onclick: setReady }, 'Pripravený na odoslanie'))),
     fileInput);
 }
 
 /* ---------- štart ---------- */
+window.addEventListener('error', (e) => { if (!/ResizeObserver/.test(e.message || '')) toast(`Chyba: ${e.message || 'neznáma'}`, 7000); });
+window.addEventListener('unhandledrejection', (e) => toast(`Chyba: ${e.reason?.message || e.reason || 'neznáma'}`, 7000));
+
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }

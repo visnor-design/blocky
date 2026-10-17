@@ -276,3 +276,35 @@ h3.gap { margin: 16px 0 6px; }
 .vat th:first-child, .vat td:first-child { padding-left: 0; }
 .verline { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 14px; }
 .pills { margin-bottom: 8px; }
+
+/* Pokladňa / karta */
+.paychips { display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; }
+.pchip { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; min-height: 40px; padding: 0 11px; border-radius: 99px; border: var(--bw) solid var(--bd); background: var(--paper); font-weight: var(--fw); font-size: 0.95rem; }
+.pchip .num { background: var(--hair); border-radius: 99px; padding: 0 8px; font-size: 0.82rem; }
+.pchip.on { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+.pchip.on .num { background: rgba(255,255,255,0.28); }
+.paysel { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.paysel button { display: grid; gap: 0; justify-items: center; min-height: 62px; padding: 8px 10px; border-radius: 14px; border: var(--bw) solid var(--bd); background: var(--paper); font-weight: var(--fw); font-size: 1.05rem; }
+.paysel button small { font-weight: 500; font-size: 0.82rem; opacity: 0.8; }
+.paysel button.on { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+.pay { font-weight: 700; }
+.pay::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: currentColor; }
+.pay.cash { color: #8A6200; } .pay.card { color: #3C54B0; } .pay.none { color: var(--warn); }
+@media (prefers-color-scheme: dark) { .pay.cash { color: #E3B65A; } .pay.card { color: #93A9F2; } }
+.sendgroup { padding: 14px 0; border-top: 1px solid var(--hair2); display: grid; gap: 8px; }
+.sendgroup h3 { margin: 0; font-size: 1.05rem; color: var(--ink); }
+.sendgroup p { margin: 0; }
+
+/* Hlavička: pripravené so sumou, rozpracované osobitne */
+.big { grid-template-columns: auto 1fr; }
+.big-main { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; align-self: end; }
+.big-amt { font-size: 1.25rem; letter-spacing: -0.02em; white-space: nowrap; }
+.draftline { color: var(--ink-soft); font-size: 0.95rem; padding: 0 0 14px; }
+.hero h1.sm { font-size: 1.3rem; }
+.foot.nomargin { margin: 8px 0 0; }
+
+/* Fotenie bločku: rám cez celú výšku obrazovky */
+.scanbody { position: relative; flex: 1; min-height: 0; margin-top: env(safe-area-inset-top); }
+.scan .frame.tall { top: 88px; bottom: 8px; height: auto; width: min(68vw, 340px); aspect-ratio: auto; transform: translateX(-50%); border-radius: 16px; }
+.scan .hint.top { top: 8px; padding: 0 110px 0 20px; text-align: left; font-size: 1rem; line-height: 1.3; }
+.barrow { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
